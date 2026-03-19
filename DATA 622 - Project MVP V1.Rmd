@@ -1,0 +1,459 @@
+---
+title: "DATA 622 Project"
+author: "Catherine Dube, Guillermo Schneider, Tai Chou-Kudu"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, 
+  out.width = "100%", 
+  fig.align = "center"
+)
+
+if(!require(pacman)) install.packages("pacman")
+pacman::p_load(
+   tidyverse, 
+   fpp3, 
+   rstudioapi,
+   tidycensus,
+   r5r, 
+   sf, #spacial data handling
+   tigris, #NYC geography
+   mapview,
+   osmextract,
+   arrow, # read parquet data, designed for random access?
+   dplyr,
+   janitor # clean up the names of columns that have spaces (subway entrances data)
+)
+projPath <- dirname(file.path(getSourceEditorContext()$path))
+
+```
+
+
+# The "Last-Mile" Behavioral Classifier
+
+## Foundation 
+
+### Census Data 
+
+Looking at census data from **2022**. 
+
+Picked 2022 because:
+
+* This is a good Post-Pandemic option; NYC was "fully reopened" 
+* The 5-Year ACS helps avoid the 2020 collection gap (where due to COVID, the Census Bureau couldn't send people door to door) and the 2021 remote-forward living arrangements, where many people left Manhattan during the high period of remote work.
+* The 5-year estimate is a rolling average (2018–2022), and some COVID-impacted data is included either way. However, multiple years of more robust data are included in this time window.
+
+Why is this data important?
+
+* The census data provides **Feature variables** that describe what New Yorkers looked like in a given region. These are inputs. 
+
+**REVISIT ME:** 
+
+* Currently: looking at vehicle availability, household income, age, and population size.
+* Future: probably want to comb through other features of interest from the census data. Potentially look at feature engineering, and at normalizing or standardizing the features as needed.
+
+```{r acquire-census-data} 
+
+#CENSUS_API_KEY is in environment 
+
+nyc_counties <- c("New York", "Kings", "Queens", "Bronx", "Richmond")
+
+# Variables: 
+# B08201_002: No vehicle available
+# B19013_001: Median Household Income
+# B01002_001: Median Age
+vars <- c(no_car = "B08201_002", 
+          med_income = "B19013_001", 
+          med_age = "B01002_001",
+          total_pop = "B01003_001")
+
+# Getting from census data
+nyc_tracts <- get_acs(
+  geography = "tract",
+  variables = vars,
+  state = "NY",
+  county = nyc_counties,
+  geometry = TRUE, # for map shapes
+  year = 2022,
+  output = "wide"
+)
+
+# Clean up column names (removing the 'E' suffix from estimate)
+nyc_tracts <- nyc_tracts %>%
+  rename(no_car = no_carE, 
+         med_income = med_incomeE, 
+         med_age = med_ageE, 
+         total_pop = total_popE) %>%
+  mutate(pct_no_car = (no_car / total_pop) * 100)
+
+# Save 
+census_save_path <- file.path(projPath, "data", "nyc_census_tracts.rds") 
+saveRDS(nyc_tracts, census_save_path)
+
+print(paste("Census features and geometry saved to:", census_save_path))
+
+# Peak
+head(nyc_tracts)
+```
+
+### Taxi Zones
+
+```{r taxi-zones}  
+#Zip file from below url is downloaded and extracted into repo
+#taxi_zones_url <- "https://d37ci6vzurychx.cloudfront.net/misc/taxi_zones.zip" 
+
+# Read the shapefile
+taxi_zones_sf <- st_read(file.path(projPath, 'taxi_zones', 'taxi_zones', "taxi_zones.shp")) %>%
+  st_transform(4326) # Transform to standard Lat/Long (WGS84)
+
+# Lookup table with names and boroughs is downloaded into repo
+#zone_lookup_url <- "https://d37ci6vzurychx.cloudfront.net/misc/taxi_zone_lookup.csv"
+zone_lookup <- read_csv(file.path(projPath, 'taxi_zone_lookup.csv'))
+
+# Join 
+taxi_zones <- taxi_zones_sf %>%
+  left_join(zone_lookup, by = c("LocationID" = "LocationID"))
+
+# Peak: Does this map look right 
+plot(st_geometry(taxi_zones))
+```
+
+### TLC Data
+
+TLC Data is from the [NYC Taxi and Limousine Commission](https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page).
+
+High volume for hire vehicles = Uber/Lyft.
+
+* Originally was pulling **January 2026** data for High Volume for-hire vehicles.
+ * https://d37ci6vzurychx.cloudfront.net/trip-data/fhvhv_tripdata_2026-01.parquet 
+* Currently pulling **October 2023** data for yellow taxis, green taxis, ~for-hire vehicles (FHV (local livery/black car)),~ and high volume for-hire vehicles (FHVHV (Uber/Lyft) Uber/Lyft). This made a little more sense with the 2022 census data, and with the seasonality of commuting and to avoid holiday season. 
+ * https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2023-10.parquet 
+ * https://d37ci6vzurychx.cloudfront.net/trip-data/green_tripdata_2023-10.parquet 
+ * https://d37ci6vzurychx.cloudfront.net/trip-data/fhv_tripdata_2023-10.parquet
+ * https://d37ci6vzurychx.cloudfront.net/trip-data/fhvhv_tripdata_2023-10.parquet 
+
+**REVISIT ME:** 
+
+* Currently:   
+* Future:  
+ 
+```{r acquire-october-2023-tlc} 
+## Aggregate all vehicular trips for October 2023
+# Combine Yellow, Green, FHV, and High-Volume FHV (Uber/Lyft) 
+# See "all" the car-based 'Last-Mile' choices
+
+# URL definitions for source data
+tlc_urls <- c(
+  yellow = "https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2023-10.parquet",
+  green  = "https://d37ci6vzurychx.cloudfront.net/trip-data/green_tripdata_2023-10.parquet",
+  #fhv    = "https://d37ci6vzurychx.cloudfront.net/trip-data/fhv_tripdata_2023-10.parquet",
+  fhvhv  = "https://d37ci6vzurychx.cloudfront.net/trip-data/fhvhv_tripdata_2023-10.parquet"
+)
+
+# Function to read and count trips by Taxi Zone 
+# PULocationID can be used to get the # of trips that started from (were picked up in) a zone
+count_zone_trips <- function(url) { 
+  read_parquet(url, col_select = any_of(c("PULocationID"))) %>%
+    count(PULocationID, name = "trips") %>%
+    filter(!is.na(PULocationID))
+}
+
+# Process the sources and sum them up 
+# Getting number of trips that started per pick up location
+# This 'map_dfr' loop downloads each, counts by zone, and stacks them.
+total_zone_counts <- tlc_urls %>%
+  map_dfr(count_zone_trips) %>%
+  group_by(PULocationID) %>%
+  summarize(total_vehicular_trips = sum(trips))
+```
+
+### Census uses Tracts, TLC uses Taxi Zones
+
+The question here is how much of each Census Tract sits inside which Taxi Zone?
+
+This uses EPSG:2263 which uses the units of "feet", and can be used to calculate the square footage of an area in NY more precisely.
+
+```{r} 
+# Use Coordinate Reference System (CRS)
+# We'll use EPSG:2263 (NAD83 / New York Long Island) because it uses feet,
+# which is much better for calculating area in NYC than Lat/Long.
+nyc_tracts_proj <- st_transform(nyc_tracts, 2263)
+taxi_zones_proj <- st_transform(taxi_zones, 2263)
+
+# Intersect regions
+# This creates a new set of shapes where tracts and zones overlap
+intersection <- st_intersection(nyc_tracts_proj, taxi_zones_proj) %>%
+  mutate(intersect_area = st_area(.))
+
+# Calculate the weights
+# For every unique Census Tract, 
+# What % of Tract X's area is inside Taxi Zone Y?
+tract_weights <- intersection %>%
+  as_tibble() %>%
+  group_by(GEOID) %>%
+  mutate(total_tract_area = sum(intersect_area)) %>%
+  ungroup() %>%
+  mutate(weight = as.numeric(intersect_area / total_tract_area)) %>%
+  select(GEOID, LocationID, zone, weight)
+
+# Peak Crosswalk 
+head(tract_weights)
+```
+
+ 
+```{r}
+
+# 'Spatial Weights' / Crosswalk
+# issue is that taxi zones are larger than census tracts, and we obvs want to use the data together
+# 
+# WHY: Taxi Zones are larger than Census Tracts. We use the weights from Phase 1
+# to distribute these trips into our Census Tracts (GEOIDs).
+# Assumes 'tract_weights' object exists from your earlier step.
+
+tract_vehicular_estimates <- tract_weights %>%
+  left_join(total_zone_counts, by = c("LocationID" = "PULocationID")) %>%
+  mutate(estimated_trips = total_vehicular_trips * weight) %>%
+  group_by(GEOID) %>%
+  summarize(total_uber_taxi_trips = sum(estimated_trips, na.rm = TRUE))
+
+# Save the 'Vehicular' side of the Master Table
+save_path_tlc <- file.path(projPath, "data", "processed_tlc_counts.rds")
+saveRDS(tract_vehicular_estimates, save_path_tlc)
+
+print(paste("Vehicular trip estimates for October 2023 saved to:", save_path_tlc))
+```
+ 
+### Citibike
+
+```{r citi-bike-to-census-tract }
+# Map Station IDs to Census Tracts  
+
+# file locations
+cb_file1 <- file.path(projPath, "citibike", "202601-citibike-tripdata_1.csv")
+cb_file2 <- file.path(projPath, "citibike", "202601-citibike-tripdata_2.csv")
+cb_files <- c(cb_file1, cb_file2)
+
+# Station-to-Tract Lookup Table
+# unique coordinates for every station found in files
+all_stations <- cb_files %>%
+  map_dfr(~read_csv(.x, col_select = c(start_station_id, start_lat, start_lng))) %>%
+  filter(!is.na(start_lat)) %>%
+  distinct(start_station_id, .keep_all = TRUE)
+
+# Spatial Work: Convert Stations to Points
+stations_sf <- st_as_sf(all_stations, coords = c("start_lng", "start_lat"), crs = 4326) %>%
+  st_transform(2263) # Project to NYC Feet (EPSG:2263)
+
+# Ensure nyc_tracts (from Step 1) matches the projection
+nyc_tracts_proj <- st_transform(nyc_tracts, 2263)
+
+# Find which Tract Polygon physically contains each Station Point
+station_tract_lookup <- st_join(stations_sf, nyc_tracts_proj, join = st_intersects) %>%
+  as_tibble() %>%
+  select(start_station_id, GEOID)
+
+# 4. Final Aggregation: Count Trips per Tract
+# WHY: This uses a fast table join on IDs to count millions of rows in seconds.
+tract_bike_counts <- cb_files %>%
+  map_dfr(~read_csv(.x, col_select = c(start_station_id))) %>%
+  left_join(station_tract_lookup, by = "start_station_id") %>%
+  group_by(GEOID) %>%
+  summarize(total_bike_trips = n()) %>%
+  filter(!is.na(GEOID))
+
+# 5. Save the final "Label" feature for the Machine Learning model
+save_path <- file.path(projPath, "data", "processed_bike_counts.rds")
+saveRDS(tract_bike_counts, save_path)
+
+print(paste("Success! Bike counts saved to:", save_path))
+```
+
+### Distance from Subway
+
+Source is [https://data.ny.gov/Transportation/MTA-Subway-Entrances-and-Exits-2024/i9wp-a4ja/about_data](https://data.ny.gov/Transportation/MTA-Subway-Entrances-and-Exits-2024/i9wp-a4ja/about_data). 
+
+File name is "MTA_Subway_Entrances_and_Exits__2024.csv"
+
+```{r subway-distance}
+## Distance to Subway 
+
+# Load csv
+subway_csv_path <- file.path(projPath, "MTA_Subway_Entrances_and_Exits__2024.csv")
+subway_raw <- read_csv(subway_csv_path) %>%
+  clean_names() # otherwise this had spaces in the column names
+
+# Transform into a Spatial Object (sf)
+# 'entrance_longitude' is X and 'entrance_latitude' is Y
+# 4326 is the standard GPS system (WGS84)
+subway_entrances_sf <- subway_raw %>%
+  filter(!is.na(entrance_latitude) & !is.na(entrance_longitude)) %>%
+  st_as_sf(coords = c("entrance_longitude", "entrance_latitude"), crs = 4326) %>%
+  st_transform(2263) # Convert to NYC Feet to match our Census Tracts
+
+# Centroids
+# Find the center point of every Census Tract
+tract_centers <- st_centroid(nyc_tracts_proj)
+
+# Nearest Entrance for every Tract
+# Find the closest subway for each tract
+nearest_indices <- st_nearest_feature(tract_centers, subway_entrances_sf)
+
+# Distance in Miles
+# (Distance in feet / 5280)
+dist_to_subway_feet <- st_distance(tract_centers, subway_entrances_sf[nearest_indices, ], by_element = TRUE)
+
+subway_dist_lookup <- nyc_tracts_proj %>%
+  as_tibble() %>%
+  mutate(dist_subway_miles = as.numeric(dist_to_subway_feet) / 5280) %>%
+  select(GEOID, dist_subway_miles)
+
+# Save the Subway Distance
+saveRDS(subway_dist_lookup, file.path(projPath, "data", "subway_dist_lookup.rds"))
+
+print("Subway distance feature successfully calculated from MTA data!")
+```
+
+## Assembling
+
+### Big Join
+
+```{r big-join}
+## Big Join 
+
+# Load components
+census_features <- readRDS(file.path(projPath, "data", "nyc_census_tracts.rds"))
+bike_counts     <- readRDS(file.path(projPath, "data", "processed_bike_counts.rds"))
+tlc_counts      <- readRDS(file.path(projPath, "data", "processed_tlc_counts.rds"))
+subway_dist     <- readRDS(file.path(projPath, "data", "subway_dist_lookup.rds"))
+
+# RECENTLY ADDED
+# Before joining, force each Tract to belong to only one Taxi Zone, the one it overlaps most.
+# I was seeing repeating values of income and distance for different zones in the final data set back when I was not doing this. 
+unique_weights <- tract_weights %>%
+  group_by(GEOID) %>%
+  slice_max(weight, n = 1, with_ties = FALSE) %>% 
+  ungroup() %>%
+  select(GEOID, LocationID, zone) # Keep the Zone name and ID for joining
+
+# Join everything to the Census Tracts
+# left_join to not lose any tracts that might have had 0 trips
+master_table <- census_features %>%
+  as_tibble() %>% 
+  select(GEOID, med_income, med_age, pct_no_car, total_pop) %>%
+  # unique Neighborhood/LocationID mapping
+  left_join(unique_weights, by = "GEOID") %>%
+  # Bike counts (already at Tract level)
+  left_join(bike_counts, by = "GEOID") %>%
+  # Uber/Taxi counts  
+  left_join(tlc_counts, by = "GEOID") %>% 
+  # Subway Distance (already at Tract level)
+  left_join(subway_dist, by = "GEOID")
+
+
+# Clean up NAs; create the Target Variable
+# If a tract has no recorded trips, replace NA with 0
+master_table <- master_table %>%
+  mutate(
+    total_bike_trips = replace_na(total_bike_trips, 0),
+    total_uber_taxi_trips = replace_na(total_uber_taxi_trips, 0),
+    
+    # CALCULATE THE TARGET: % of Last-Mile trips taken by Bike
+    # Formula: Bike / (Bike + Uber)
+    bike_index = total_bike_trips / (total_bike_trips + total_uber_taxi_trips)
+  ) %>%
+  # Filter out tracts with 0 total trips to avoid "Divided by Zero" errors
+  filter(!is.na(bike_index))
+
+# Save joined data set
+saveRDS(master_table, file.path(projPath, "data", "model_input.rds"))
+
+print("Master Join Complete! The model_input.rds file is ready for Model Phase.")
+```
+
+### Intermediate Sanity Checking
+
+
+
+```{r}
+### Phase 2.5: The Data Audit (Sanity Check)
+
+# 1. Load the Master Table we just created
+master_table <- readRDS(file.path(projPath, "data", "model_input.rds"))
+
+# 2. Join with Taxi Zone names for readability
+# We'll use the tract_weights crosswalk to get neighborhood names back
+audit_table <- master_table %>%
+  select(zone, GEOID, bike_index, total_bike_trips, total_uber_taxi_trips, med_income, dist_subway_miles)
+
+# 3. Top 10 "Bike-Heavy" Neighborhoods (Active)
+top_bike <- audit_table %>%
+  arrange(desc(bike_index)) %>%
+  head(50)
+
+# 4. Top 10 "Uber-Heavy" Neighborhoods (Vehicular)
+top_uber <- audit_table %>%
+  arrange(bike_index) %>%
+  head(50)
+
+# 5. Print a quick summary
+print("--- TOP 10 BIKE-HEAVY TRACTS ---")
+print(top_bike)
+
+print("--- TOP 10 UBER-HEAVY TRACTS ---")
+print(top_uber)
+```
+
+
+## Model Building (Super Duper Rough, Proof of Concept)
+
+It's late in the evening, so I just did a quick AI pass at this with a linear model for proof of concept.
+
+###
+
+```{r machine-learning-poc}
+# 1. Prepare the Data
+# We filter for only the columns the model should "learn" from
+ml_data <- readRDS(file.path(projPath, "data", "model_input.rds")) %>%
+  select(bike_index, med_income, med_age, pct_no_car, dist_subway_miles, total_pop) %>%
+  drop_na()
+
+# 2. Fit the Linear Model
+# Formula: bike_index is explained by (~) all other variables (.)
+lm_fit <- lm(bike_index ~ ., data = ml_data)
+
+# 3. View the "Coefficients"
+# This is the heart of the model
+summary(lm_fit)
+
+###
+# Load broom for tidy model outputs
+pacman::p_load(broom, dotwhisker)
+
+# Turn the model results into a clean table
+lm_results <- tidy(lm_fit) %>%
+  filter(term != "(Intercept)") # Remove the intercept for better scaling
+
+# Plot the "Pull" of each feature
+ggplot(lm_results, aes(x = estimate, y = reorder(term, estimate))) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  geom_point(size = 3, color = "darkblue") +
+  geom_errorbarh(aes(xmin = estimate - std.error, xmax = estimate + std.error), height = 0.2) +
+  theme_minimal() +
+  labs(title = "Linear Model: What drives the 'Bike Index'?",
+       subtitle = "Points to the right increase biking; points to the left decrease it.",
+       x = "Estimate (Coefficient)",
+       y = "Feature")
+```
+
+## Misc. Notes Dump
+
+The "Hybrid" Workflow (The Pro Move)
+Since you are using GitHub, here is how you should structured your work:
+
+data_prep.Rmd: Use this to join the Census data, TLC data, and Citi Bike data. At the end of this file, use write_rds(final_data, "data/model_input.rds").
+
+app.R: This file should be very "slim." It just reads model_input.rds, runs the ML prediction, and shows the map.
+
+Analogy: data_prep.Rmd is the kitchen where you chop the vegetables; app.R is the dining table where the customer sees the finished meal. You don't want the customer sitting in the middle of the kitchen! 
