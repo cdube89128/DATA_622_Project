@@ -60,14 +60,54 @@ Why is this data important?
 
 nyc_counties <- c("New York", "Kings", "Queens", "Bronx", "Richmond")
 
-# Variables: 
-# B08201_002: No vehicle available
-# B19013_001: Median Household Income
-# B01002_001: Median Age
-vars <- c(no_car = "B08201_002", 
-          med_income = "B19013_001", 
-          med_age = "B01002_001",
-          total_pop = "B01003_001")
+ 
+# Entire 2022 5-Year ACS variable dictionary
+acs_vars_2022 <- load_variables(2022, "acs5", cache = TRUE)
+
+# MISC.
+# Exploring different potential features
+feature_exploration <- acs_vars_2022 %>%
+  filter(
+    str_detect(str_to_lower(label), "public transportation|bicycle|walked|worked from home") |
+    str_detect(str_to_lower(concept), "means of transportation to work|travel time")
+  )
+
+# Comment Me out before final knit
+#View(feature_exploration)
+```
+
+```{r more-census-data}
+
+# Define all API variables explicitly
+vars <- c(
+  # Base Demographics
+  no_car      = "B08201_002", 
+  med_income  = "B19013_001", 
+  med_age     = "B01002_001",
+  total_pop   = "B01003_001",
+  
+  # Transportation Base & Features
+  tot_workers = "B08301_001",
+  transit     = "B08301_010",
+  walk        = "B08301_019",
+  wfh         = "B08301_021",
+  
+  # Travel Time Features
+  commute_60  = "B08303_012",
+  commute_90  = "B08303_013",
+  
+  # Education Base & Features
+  tot_pop_25  = "B15003_001",
+  bachelors   = "B15003_022",
+  
+  # Occupation Base & The 5 Major Buckets
+  tot_employ  = "C24010_001",
+  mngmt_job   = "C24010_002",
+  service_job = "C24010_014",
+  sales_job   = "C24010_021",
+  const_job   = "C24010_030",
+  trans_job   = "C24010_034"
+)
 
 # Getting from census data
 nyc_tracts <- get_acs(
@@ -75,27 +115,153 @@ nyc_tracts <- get_acs(
   variables = vars,
   state = "NY",
   county = nyc_counties,
-  geometry = TRUE, # for map shapes
+  geometry = TRUE, 
   year = 2022,
   output = "wide"
 )
 
-# Clean up column names (removing the 'E' suffix from estimate)
-nyc_tracts <- nyc_tracts %>%
-  rename(no_car = no_carE, 
-         med_income = med_incomeE, 
-         med_age = med_ageE, 
-         total_pop = total_popE) %>%
-  mutate(pct_no_car = (no_car / total_pop) * 100)
+```
 
+```{r feature-engineering-census-data}
+nyc_tracts <- nyc_tracts %>%
+  select(
+    GEOID, 
+    NAME, 
+    geometry,
+    no_car      = no_carE,
+    med_income  = med_incomeE,
+    med_age     = med_ageE,
+    total_pop   = total_popE,
+    tot_workers = tot_workersE,
+    tot_pop_25  = tot_pop_25E,
+    tot_employ  = tot_employE,
+    transit     = transitE,
+    walk        = walkE,
+    wfh         = wfhE,
+    commute_60  = commute_60E,
+    commute_90  = commute_90E,
+    bachelors   = bachelorsE,
+    mngmt_job   = mngmt_jobE,
+    service_job = service_jobE,
+    sales_job   = sales_jobE,
+    const_job   = const_jobE,
+    trans_job   = trans_jobE
+  ) %>%
+  
+  # Feature Engineering: Convert raw counts to percentages
+  mutate(
+    pct_no_car      = (no_car / total_pop) * 100,
+    pct_transit     = (transit / tot_workers) * 100,
+    pct_walk        = (walk / tot_workers) * 100,
+    pct_wfh         = (wfh / tot_workers) * 100,
+    
+    # Percentage of Commuters Traveling 60+ Minutes
+    pct_commute_60p = ((commute_60 + commute_90) / tot_workers) * 100,
+    
+    pct_bachelors   = (bachelors / tot_pop_25) * 100,
+    
+    # Occupation Percentages 
+    pct_mngmt       = (mngmt_job / tot_employ) * 100,
+    pct_service     = (service_job / tot_employ) * 100,
+    pct_sales       = (sales_job / tot_employ) * 100,
+    pct_const       = (const_job / tot_employ) * 100,
+    pct_trans       = (trans_job / tot_employ) * 100,
+    
+    # Population Density (people per square mile)
+    area_sq_miles   = as.numeric(st_area(geometry)) / 2589988, # st_area() returns square meters, converted
+    pop_density     = total_pop / area_sq_miles
+  ) %>%
+  
+  # Drop the raw counts because I don't want to accidentally put them in the ML model
+  select(-no_car, -transit, -walk, -wfh, -commute_60, -commute_90, -bachelors, 
+         -mngmt_job, -service_job, -sales_job, -const_job, -trans_job, 
+         -tot_workers, -tot_pop_25, -tot_employ)
+```
+
+```{r census-missing-data-exploration}
+## Checking for total NAs and NaNs in each column
+colSums(is.na(nyc_tracts %>% st_drop_geometry())) %>%
+  kable(caption = "# of NAs and NaNs in each column")
+
+## Percentage of missing data 
+# (is it a low enough percent to be negligible) 
+missing_summary <- nyc_tracts %>%
+  st_drop_geometry() %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(cols = everything(), names_to = "Feature", values_to = "Missing_Count") %>%
+  mutate(
+    Total_Rows = nrow(nyc_tracts),
+    Pct_Missing = (Missing_Count / Total_Rows) * 100,
+    
+    # Flag if the missing data is below 5% 
+    Is_Negligible_Under_5Pct = Pct_Missing < 5 
+  ) %>%
+  # Filter to only show features that actually have missing data
+  filter(Missing_Count > 0) %>% 
+  arrange(desc(Pct_Missing))
+
+# Output Percentage of Missing Data
+kable(missing_summary, digits = 2, caption = "Missing Data Percentage by Feature")
+
+
+## Map for missing income data
+missing_map_data <- nyc_tracts %>%
+  mutate(missing_income_flag = ifelse(is.na(med_income), "Missing Data", "Valid Data"))
+
+ggplot(missing_map_data) +
+  geom_sf(aes(fill = missing_income_flag), color = "white", size = 0.1) +
+  scale_fill_manual(values = c("Valid Data" = "#e0e0e0", "Missing Data" = "#d73027")) +
+  theme_void() +
+  labs(title = "Map of Missing Census Income Data",
+       fill = "Status") 
+```
+
+```{r census-na-handling}
+## Drop tracts with less than 50 people or 0 workers
+# There were a ton of tracts with a small number of or 0 people, screwing with denominators and also making for super volatile percentages
+nyc_tracts_clean <- nyc_tracts %>%
+  filter(total_pop >= 50, !is.na(pct_transit))
+
+## Imputing
+# There were also many tracts where income or age was missing, but it wasn't due to a denominator issue
+## RETURN HERE
+## Just doing simple median imputation
+## More robust method would be better
+## Checking for MNAR and stuff would be better
+# Right now
+nyc_tracts_clean <- nyc_tracts_clean %>%
+  # Extract the borough from the NAME string (e.g., "Queens County")
+  mutate(borough = str_extract(NAME, "(?<=; ).*(?= County)")) %>%
+  
+  # Group by Borough so the imputation is localized
+  group_by(borough) %>%
+  mutate(
+    med_income = ifelse(is.na(med_income), 
+                        median(med_income, na.rm = TRUE), 
+                        med_income),
+    med_age = ifelse(is.na(med_age), 
+                     median(med_age, na.rm = TRUE), 
+                     med_age)
+  ) %>%
+  ungroup() %>%
+  
+  # Drop the temporary borough column 
+  select(-borough)
+ 
+print(paste("Original tracts:", nrow(nyc_tracts)))
+print(paste("Cleaned tracts of NAs:", nrow(nyc_tracts_clean)))
+```
+
+
+```{r save-census-data}
 # Save 
 census_save_path <- file.path(projPath, "data", "nyc_census_tracts.rds") 
-saveRDS(nyc_tracts, census_save_path)
+saveRDS(nyc_tracts_clean, census_save_path)
 
 print(paste("Census features and geometry saved to:", census_save_path))
 
 # Peak
-head(nyc_tracts)
+head(nyc_tracts_clean)
 ```
 
 ### Taxi Zones
@@ -227,18 +393,36 @@ print(paste("Vehicular trip estimates for October 2023 saved to:", save_path_tlc
  
 ### Citibike
 
+* [Citibike Data Download](https://s3.amazonaws.com/tripdata/index.html)
+  * Because the Citibike publishes their data online in zip files, it can't be read directly from web.
+* Originally was pulling **January 2026** data for citibike
+  * 202601-citibike-tripdata_1.csv
+  * 202601-citibike-tripdata_2.csv
+* Currently pulling **October 2023** data  
+  * 
+
+
 ```{r citi-bike-to-census-tract }
 # Map Station IDs to Census Tracts  
 
 # file locations
-cb_file1 <- file.path(projPath, "citibike", "202601-citibike-tripdata_1.csv")
-cb_file2 <- file.path(projPath, "citibike", "202601-citibike-tripdata_2.csv")
-cb_files <- c(cb_file1, cb_file2)
+cb_file1 <- file.path(projPath, "citibike", "202310-citibike-tripdata_1.csv")
+cb_file2 <- file.path(projPath, "citibike", "202310-citibike-tripdata_2.csv")
+cb_file3 <- file.path(projPath, "citibike", "202310-citibike-tripdata_3.csv")
+cb_file4 <- file.path(projPath, "citibike", "202310-citibike-tripdata_4.csv")
+cb_files <- c(cb_file1, cb_file2, cb_file3, cb_file4)
 
 # Station-to-Tract Lookup Table
 # unique coordinates for every station found in files
 all_stations <- cb_files %>%
-  map_dfr(~read_csv(.x, col_select = c(start_station_id, start_lat, start_lng))) %>%
+  map_dfr(~read_csv(.x, 
+                    col_select = c(start_station_id, start_lat, start_lng),
+                    # Force the station ID to be a character, and coords to be numeric
+                    col_types = cols(
+                      start_station_id = col_character(),
+                      start_lat = col_double(),
+                      start_lng = col_double()
+                    ))) %>%
   filter(!is.na(start_lat)) %>%
   distinct(start_station_id, .keep_all = TRUE)
 
@@ -255,9 +439,12 @@ station_tract_lookup <- st_join(stations_sf, nyc_tracts_proj, join = st_intersec
   select(start_station_id, GEOID)
 
 # 4. Final Aggregation: Count Trips per Tract
-# WHY: This uses a fast table join on IDs to count millions of rows in seconds.
+# WHY: This uses a fast table join on IDs to count millions of rows in seconds. 
 tract_bike_counts <- cb_files %>%
-  map_dfr(~read_csv(.x, col_select = c(start_station_id))) %>%
+  map_dfr(~read_csv(.x, 
+                    col_select = c(start_station_id),
+                    col_types = cols(start_station_id = col_character()) # Added here too!
+                    )) %>%
   left_join(station_tract_lookup, by = "start_station_id") %>%
   group_by(GEOID) %>%
   summarize(total_bike_trips = n()) %>%
@@ -340,8 +527,7 @@ unique_weights <- tract_weights %>%
 # Join everything to the Census Tracts
 # left_join to not lose any tracts that might have had 0 trips
 master_table <- census_features %>%
-  as_tibble() %>% 
-  select(GEOID, med_income, med_age, pct_no_car, total_pop) %>%
+  st_drop_geometry() %>% # drops the maps, keeps ALL features 
   # unique Neighborhood/LocationID mapping
   left_join(unique_weights, by = "GEOID") %>%
   # Bike counts (already at Tract level)
@@ -416,7 +602,13 @@ It's late in the evening, so I just did a quick AI pass at this with a linear mo
 # 1. Prepare the Data
 # We filter for only the columns the model should "learn" from
 ml_data <- readRDS(file.path(projPath, "data", "model_input.rds")) %>%
-  select(bike_index, med_income, med_age, pct_no_car, dist_subway_miles, total_pop) %>%
+  # Select the target AND  features
+  select(
+    bike_index, med_income, med_age, pct_no_car, 
+    dist_subway_miles, pop_density, pct_transit, 
+    pct_walk, pct_wfh, pct_commute_60p, pct_bachelors, 
+    pct_mngmt, pct_service, pct_sales, pct_const, pct_trans
+  ) %>%
   drop_na()
 
 # 2. Fit the Linear Model

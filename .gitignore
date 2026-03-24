@@ -1,0 +1,5 @@
+*.csv
+*.Rmd
+*.html
+citibike/
+taxi_zones/
