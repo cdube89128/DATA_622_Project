@@ -1,7 +1,11 @@
 ---
 title: "DATA 622 Project"
 author: "Catherine Dube, Guillermo Schneider, Tai Chou-Kudu"
-output: html_document
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
 ---
 
 ```{r setup, include=FALSE}
@@ -24,6 +28,7 @@ pacman::p_load(
    osmextract,
    arrow, # read parquet data, designed for random access?
    dplyr,
+   knitr,
    janitor # clean up the names of columns that have spaces (subway entrances data)
 )
 projPath <- dirname(file.path(getSourceEditorContext()$path))
@@ -31,7 +36,7 @@ projPath <- dirname(file.path(getSourceEditorContext()$path))
 ```
 
 
-# The "Last-Mile" Behavioral Classifier
+# Modeling Citi Bike vs. Rideshare Usage in NYC
 
 ## Foundation 
 
@@ -438,19 +443,27 @@ station_tract_lookup <- st_join(stations_sf, nyc_tracts_proj, join = st_intersec
   as_tibble() %>%
   select(start_station_id, GEOID)
 
-# 4. Final Aggregation: Count Trips per Tract
-# WHY: This uses a fast table join on IDs to count millions of rows in seconds. 
+# Count the number of unique stations in each Census Tract
+tract_station_counts <- station_tract_lookup %>%
+  group_by(GEOID) %>%
+  summarize(total_stations = n()) %>%
+  filter(!is.na(GEOID))
+
+# Count Trips per Tract 
 tract_bike_counts <- cb_files %>%
   map_dfr(~read_csv(.x, 
                     col_select = c(start_station_id),
-                    col_types = cols(start_station_id = col_character()) # Added here too!
+                    col_types = cols(start_station_id = col_character()) 
                     )) %>%
   left_join(station_tract_lookup, by = "start_station_id") %>%
   group_by(GEOID) %>%
   summarize(total_bike_trips = n()) %>%
-  filter(!is.na(GEOID))
+  filter(!is.na(GEOID)) %>%
+  # NEW: Attach the station capacity feature to the trip counts
+  left_join(tract_station_counts, by = "GEOID")
 
-# 5. Save the final "Label" feature for the Machine Learning model
+
+# Save the final "Label" feature for the Machine Learning model
 save_path <- file.path(projPath, "data", "processed_bike_counts.rds")
 saveRDS(tract_bike_counts, save_path)
 
@@ -515,7 +528,6 @@ bike_counts     <- readRDS(file.path(projPath, "data", "processed_bike_counts.rd
 tlc_counts      <- readRDS(file.path(projPath, "data", "processed_tlc_counts.rds"))
 subway_dist     <- readRDS(file.path(projPath, "data", "subway_dist_lookup.rds"))
 
-# RECENTLY ADDED
 # Before joining, force each Tract to belong to only one Taxi Zone, the one it overlaps most.
 # I was seeing repeating values of income and distance for different zones in the final data set back when I was not doing this. 
 unique_weights <- tract_weights %>%
@@ -540,16 +552,16 @@ master_table <- census_features %>%
 
 # Clean up NAs; create the Target Variable
 # If a tract has no recorded trips, replace NA with 0
+# If a tract has no stations, replace NA with 0
 master_table <- master_table %>%
   mutate(
-    total_bike_trips = replace_na(total_bike_trips, 0),
+    total_bike_trips      = replace_na(total_bike_trips, 0),
     total_uber_taxi_trips = replace_na(total_uber_taxi_trips, 0),
+    total_stations        = replace_na(total_stations, 0), 
     
     # CALCULATE THE TARGET: % of Last-Mile trips taken by Bike
-    # Formula: Bike / (Bike + Uber)
     bike_index = total_bike_trips / (total_bike_trips + total_uber_taxi_trips)
   ) %>%
-  # Filter out tracts with 0 total trips to avoid "Divided by Zero" errors
   filter(!is.na(bike_index))
 
 # Save joined data set
