@@ -29,7 +29,8 @@ pacman::p_load(
    arrow, # read parquet data, designed for random access?
    dplyr,
    knitr,
-   janitor # clean up the names of columns that have spaces (subway entrances data)
+   janitor, # clean up the names of columns that have spaces (subway entrances data)
+   tidygeocoder
 )
 projPath <- dirname(file.path(getSourceEditorContext()$path))
 
@@ -82,8 +83,7 @@ feature_exploration <- acs_vars_2022 %>%
 ```
 
 ```{r more-census-data}
-
-# Define all API variables explicitly
+# Define all API variables explicitly  
 vars <- c(
   # Base Demographics
   no_car      = "B08201_002", 
@@ -111,8 +111,33 @@ vars <- c(
   service_job = "C24010_014",
   sales_job   = "C24010_021",
   const_job   = "C24010_030",
-  trans_job   = "C24010_034"
-)
+  trans_job   = "C24010_034",
+
+  # Continuous Age Spectrum (Table B01001 - Detailed Age)
+  # 18 to 24
+  m_18_19="B01001_007", m_20="B01001_008", m_21="B01001_009", m_22_24="B01001_010",
+  f_18_19="B01001_031", f_20="B01001_032", f_21="B01001_033", f_22_24="B01001_034",
+  # 25 to 34
+  m_25_29="B01001_011", m_30_34="B01001_012", f_25_29="B01001_035", f_30_34="B01001_036",
+  # 35 to 44
+  m_35_39="B01001_013", m_40_44="B01001_014", f_35_39="B01001_037", f_40_44="B01001_038",
+  # 45 to 64
+  m_45_49="B01001_015", m_50_54="B01001_016", m_55_59="B01001_017", m_60_61="B01001_018", m_62_64="B01001_019",
+  f_45_49="B01001_039", f_50_54="B01001_040", f_55_59="B01001_041", f_60_61="B01001_042", f_62_64="B01001_043",
+  # 65 Plus
+  m_65_66="B01001_020", m_67_69="B01001_021", m_70_74="B01001_022", m_75_79="B01001_023", m_80_84="B01001_024", m_85_up="B01001_025",
+  f_65_66="B01001_044", f_67_69="B01001_045", f_70_74="B01001_046", f_75_79="B01001_047", f_80_84="B01001_048", f_85_up="B01001_049",
+
+  # Commercial vs. Residential Proxy (Housing)
+  tot_housing = "B25002_001",
+  vacant_unit = "B25002_003",
+  tot_occup   = "B25003_001",
+  renter_unit = "B25003_003",
+
+  # Economic Barrier Spectrum (Poverty)
+  tot_pov_base = "B17001_001",
+  pov_below    = "B17001_002"
+) 
 
 # Getting from census data
 nyc_tracts <- get_acs(
@@ -129,28 +154,55 @@ nyc_tracts <- get_acs(
 
 ```{r feature-engineering-census-data}
 nyc_tracts <- nyc_tracts %>%
+  # Explicitly rename every variable 
   select(
-    GEOID, 
-    NAME, 
-    geometry,
-    no_car      = no_carE,
-    med_income  = med_incomeE,
-    med_age     = med_ageE,
-    total_pop   = total_popE,
-    tot_workers = tot_workersE,
-    tot_pop_25  = tot_pop_25E,
+    GEOID, NAME, geometry,
+    
+    # Base Demographics
+    no_car      = no_carE, 
+    med_income  = med_incomeE, 
+    med_age     = med_ageE, 
+    total_pop   = total_popE, 
+    tot_workers = tot_workersE, 
+    tot_pop_25  = tot_pop_25E, 
     tot_employ  = tot_employE,
-    transit     = transitE,
-    walk        = walkE,
-    wfh         = wfhE,
-    commute_60  = commute_60E,
-    commute_90  = commute_90E,
-    bachelors   = bachelorsE,
-    mngmt_job   = mngmt_jobE,
-    service_job = service_jobE,
-    sales_job   = sales_jobE,
-    const_job   = const_jobE,
-    trans_job   = trans_jobE
+    
+    # Transportation & Travel Time
+    transit     = transitE, 
+    walk        = walkE, 
+    wfh         = wfhE, 
+    commute_60  = commute_60E, 
+    commute_90  = commute_90E, 
+    
+    # Education & Occupation
+    bachelors   = bachelorsE, 
+    mngmt_job   = mngmt_jobE, 
+    service_job = service_jobE, 
+    sales_job   = sales_jobE, 
+    const_job   = const_jobE, 
+    trans_job   = trans_jobE,
+    
+    # Age - Males
+    m_18_19 = m_18_19E, m_20 = m_20E, m_21 = m_21E, m_22_24 = m_22_24E,
+    m_25_29 = m_25_29E, m_30_34 = m_30_34E,
+    m_35_39 = m_35_39E, m_40_44 = m_40_44E,
+    m_45_49 = m_45_49E, m_50_54 = m_50_54E, m_55_59 = m_55_59E, m_60_61 = m_60_61E, m_62_64 = m_62_64E,
+    m_65_66 = m_65_66E, m_67_69 = m_67_69E, m_70_74 = m_70_74E, m_75_79 = m_75_79E, m_80_84 = m_80_84E, m_85_up = m_85_upE,
+    
+    # Age - Females
+    f_18_19 = f_18_19E, f_20 = f_20E, f_21 = f_21E, f_22_24 = f_22_24E,
+    f_25_29 = f_25_29E, f_30_34 = f_30_34E,
+    f_35_39 = f_35_39E, f_40_44 = f_40_44E,
+    f_45_49 = f_45_49E, f_50_54 = f_50_54E, f_55_59 = f_55_59E, f_60_61 = f_60_61E, f_62_64 = f_62_64E,
+    f_65_66 = f_65_66E, f_67_69 = f_67_69E, f_70_74 = f_70_74E, f_75_79 = f_75_79E, f_80_84 = f_80_84E, f_85_up = f_85_upE,
+
+    # Housing & Poverty
+    tot_housing  = tot_housingE, 
+    vacant_unit  = vacant_unitE, 
+    tot_occup    = tot_occupE, 
+    renter_unit  = renter_unitE, 
+    tot_pov_base = tot_pov_baseE, 
+    pov_below    = pov_belowE
   ) %>%
   
   # Feature Engineering: Convert raw counts to percentages
@@ -159,28 +211,42 @@ nyc_tracts <- nyc_tracts %>%
     pct_transit     = (transit / tot_workers) * 100,
     pct_walk        = (walk / tot_workers) * 100,
     pct_wfh         = (wfh / tot_workers) * 100,
-    
-    # Percentage of Commuters Traveling 60+ Minutes
     pct_commute_60p = ((commute_60 + commute_90) / tot_workers) * 100,
-    
     pct_bachelors   = (bachelors / tot_pop_25) * 100,
-    
-    # Occupation Percentages 
     pct_mngmt       = (mngmt_job / tot_employ) * 100,
     pct_service     = (service_job / tot_employ) * 100,
     pct_sales       = (sales_job / tot_employ) * 100,
     pct_const       = (const_job / tot_employ) * 100,
     pct_trans       = (trans_job / tot_employ) * 100,
+    area_sq_miles   = as.numeric(st_area(geometry)) / 2589988, 
+    pop_density     = total_pop / area_sq_miles,
     
-    # Population Density (people per square mile)
-    area_sq_miles   = as.numeric(st_area(geometry)) / 2589988, # st_area() returns square meters, converted
-    pop_density     = total_pop / area_sq_miles
+    # Continuous Age Spectrum
+    pct_age_18_24   = ((m_18_19 + m_20 + m_21 + m_22_24 + f_18_19 + f_20 + f_21 + f_22_24) / total_pop) * 100,
+    pct_age_25_34   = ((m_25_29 + m_30_34 + f_25_29 + f_30_34) / total_pop) * 100,
+    pct_age_35_44   = ((m_35_39 + m_40_44 + f_35_39 + f_40_44) / total_pop) * 100,
+    pct_age_45_64   = ((m_45_49 + m_50_54 + m_55_59 + m_60_61 + m_62_64 + f_45_49 + f_50_54 + f_55_59 + f_60_61 + f_62_64) / total_pop) * 100,
+    pct_age_65_plus = ((m_65_66 + m_67_69 + m_70_74 + m_75_79 + m_80_84 + m_85_up + f_65_66 + f_67_69 + f_70_74 + f_75_79 + f_80_84 + f_85_up) / total_pop) * 100,
+    
+    # Commercial/Residential Proxy
+    pct_vacant      = (vacant_unit / tot_housing) * 100,
+    pct_renter      = (renter_unit / tot_occup) * 100,
+    
+    # Economic Barrier
+    pct_poverty     = (pov_below / tot_pov_base) * 100
   ) %>%
   
-  # Drop the raw counts because I don't want to accidentally put them in the ML model
-  select(-no_car, -transit, -walk, -wfh, -commute_60, -commute_90, -bachelors, 
-         -mngmt_job, -service_job, -sales_job, -const_job, -trans_job, 
-         -tot_workers, -tot_pop_25, -tot_employ)
+  # Explicitly drop the raw counts so they don't leak into the model
+  select(
+    -no_car, -transit, -walk, -wfh, -commute_60, -commute_90, -bachelors, 
+    -mngmt_job, -service_job, -sales_job, -const_job, -trans_job, 
+    -tot_workers, -tot_pop_25, -tot_employ,
+    -m_18_19, -m_20, -m_21, -m_22_24, -m_25_29, -m_30_34, -m_35_39, -m_40_44, 
+    -m_45_49, -m_50_54, -m_55_59, -m_60_61, -m_62_64, -m_65_66, -m_67_69, -m_70_74, -m_75_79, -m_80_84, -m_85_up,
+    -f_18_19, -f_20, -f_21, -f_22_24, -f_25_29, -f_30_34, -f_35_39, -f_40_44, 
+    -f_45_49, -f_50_54, -f_55_59, -f_60_61, -f_62_64, -f_65_66, -f_67_69, -f_70_74, -f_75_79, -f_80_84, -f_85_up,
+    -tot_housing, -vacant_unit, -tot_occup, -renter_unit, -tot_pov_base, -pov_below
+  )
 ```
 
 ```{r census-missing-data-exploration}
@@ -552,50 +618,61 @@ master_table <- census_features %>%
 
 # Clean up NAs; create the Target Variable
 # If a tract has no recorded trips, replace NA with 0
-# If a tract has no stations, replace NA with 0
+# If a tract has no stations, replace NA with 0 
 master_table <- master_table %>%
   mutate(
     total_bike_trips      = replace_na(total_bike_trips, 0),
     total_uber_taxi_trips = replace_na(total_uber_taxi_trips, 0),
-    total_stations        = replace_na(total_stations, 0), 
+    total_stations        = replace_na(total_stations, 0),
+    
+    # Spatial Density (Stations per Square Mile)
+    # How physically clustered is the infrastructure?
+    stations_per_sq_mile  = total_stations / area_sq_miles,
+    
+    # Per Capita Availability (Stations per 1,000 Residents)
+    # How much infrastructure exists relative to the local population size?
+    stations_per_1000_pop = (total_stations / total_pop) * 1000,
     
     # CALCULATE THE TARGET: % of Last-Mile trips taken by Bike
     bike_index = total_bike_trips / (total_bike_trips + total_uber_taxi_trips)
   ) %>%
+  # Filter out tracts with 0 total trips to avoid "Divided by Zero" errors
   filter(!is.na(bike_index))
 
 # Save joined data set
 saveRDS(master_table, file.path(projPath, "data", "model_input.rds"))
 
-print("Master Join Complete! The model_input.rds file is ready for Model Phase.")
+print("Master Join Complete. The model_input.rds file is ready for modeling.")
 ```
+
+
 
 ### Intermediate Sanity Checking
 
 
 
-```{r}
-### Phase 2.5: The Data Audit (Sanity Check)
+```{r data-audit}
+### The Data Audit (Sanity Check)
 
-# 1. Load the Master Table we just created
+# Load the Master Table
 master_table <- readRDS(file.path(projPath, "data", "model_input.rds"))
 
-# 2. Join with Taxi Zone names for readability
+# Join with Taxi Zone names for readability
 # We'll use the tract_weights crosswalk to get neighborhood names back
 audit_table <- master_table %>%
   select(zone, GEOID, bike_index, total_bike_trips, total_uber_taxi_trips, med_income, dist_subway_miles)
 
-# 3. Top 10 "Bike-Heavy" Neighborhoods (Active)
+# Top 10 "Bike-Heavy" Neighborhoods (Active)
 top_bike <- audit_table %>%
   arrange(desc(bike_index)) %>%
   head(50)
 
-# 4. Top 10 "Uber-Heavy" Neighborhoods (Vehicular)
+# Top 10 "Uber-Heavy" Neighborhoods (Vehicular)
 top_uber <- audit_table %>%
   arrange(bike_index) %>%
   head(50)
 
-# 5. Print a quick summary
+# quick summary
 print("--- TOP 10 BIKE-HEAVY TRACTS ---")
 print(top_bike)
 
@@ -611,32 +688,130 @@ It's late in the evening, so I just did a quick AI pass at this with a linear mo
 ###
 
 ```{r machine-learning-poc}
-# 1. Prepare the Data
-# We filter for only the columns the model should "learn" from
+# 1. Prepare and Standardize the Data
 ml_data <- readRDS(file.path(projPath, "data", "model_input.rds")) %>%
-  # Select the target AND  features
   select(
-    bike_index, med_income, med_age, pct_no_car, 
-    dist_subway_miles, pop_density, pct_transit, 
-    pct_walk, pct_wfh, pct_commute_60p, pct_bachelors, 
-    pct_mngmt, pct_service, pct_sales, pct_const, pct_trans
+    GEOID, # <--- WE ADD GEOID BACK HERE
+    
+    # Target
+    bike_index, 
+    
+    # Scaled Infrastructure Controls
+    stations_per_sq_mile, stations_per_1000_pop, dist_subway_miles, 
+    
+    # Economic & Housing Controls
+    med_income, pct_poverty, pct_vacant, pct_renter, 
+    
+    # Demographic & Commuter Behaviors
+    pop_density, pct_no_car, pct_transit, pct_commute_60p, pct_bachelors,
+    
+    # Continuous Age Spectrum
+    pct_age_18_24, pct_age_25_34, pct_age_35_44, pct_age_45_64, pct_age_65_plus
   ) %>%
-  drop_na()
+  drop_na() %>%
+  
+  # Standardize all predictors 
+  # We deliberately exclude BOTH our target (bike_index) and our ID (GEOID) from scaling
+  mutate(across(
+    .cols = -c(bike_index, GEOID), 
+    .fns = ~ as.numeric(scale(.))
+  ))
 
-# 2. Fit the Linear Model
-# Formula: bike_index is explained by (~) all other variables (.)
-lm_fit <- lm(bike_index ~ ., data = ml_data)
+# 2. Fit the "Kitchen Sink" Model
+# The minus sign (- GEOID) explicitly tells the model NOT to use the ID as a predictor
+lm_fit_standardized <- lm(bike_index ~ . - GEOID, data = ml_data)
 
-# 3. View the "Coefficients"
-# This is the heart of the model
-summary(lm_fit)
+# 3. Fit the "George MVP" Simple Model
+lm_fit_simple <- lm(bike_index ~ dist_subway_miles, data = ml_data)
+ 
+# View the Coefficients
+print("--- SIMPLE MVP MODEL ---")
+summary(lm_fit_simple)
 
-###
-# Load broom for tidy model outputs
-pacman::p_load(broom, dotwhisker)
+print("--- FULL STANDARDIZED MODEL ---")
+summary(lm_fit_standardized)
+```
 
-# Turn the model results into a clean table
-lm_results <- tidy(lm_fit) %>%
+```{r ibx-simulator}
+# 1. Load the geocoding package
+pacman::p_load(tidygeocoder, sf, dplyr)
+
+# 2. Build the list of stations based on the MTA's 2025 CE Document
+ibx_stations <- tibble::tribble(
+  ~station_name,             ~address,
+  "Brooklyn Army Terminal",  "2nd Ave & 61st St, Brooklyn, NY",
+  "4th Ave",                 "5th Ave & 61st St, Brooklyn, NY",
+  "8th Ave",                 "8th Ave & 61st St, Brooklyn, NY",
+  "New Utrecht Ave",         "14th Ave & 61st St, Brooklyn, NY",
+  "McDonald Ave",            "McDonald Ave & Avenue I, Brooklyn, NY",
+  "East 16th St",            "East 16th St & Avenue H, Brooklyn, NY",
+  "Flatbush-Nostrand Ave",   "Nostrand Ave & Avenue H, Brooklyn, NY",
+  "Utica Ave",               "Utica Ave & Farragut Rd, Brooklyn, NY",
+  "Remsen Ave",              "Remsen Ave & Farragut Rd, Brooklyn, NY",
+  "Linden Blvd",             "Linden Blvd & Junius St, Brooklyn, NY",
+  "Livonia Ave",             "Livonia Ave & Junius St, Brooklyn, NY",
+  "Sutter Ave",              "Sutter Ave & Junius St, Brooklyn, NY",
+  "Atlantic Ave",            "Atlantic Ave & East New York Ave, Brooklyn, NY",
+  "Wilson Ave",              "Wilson Ave & Moffat St, Brooklyn, NY",
+  "Myrtle Ave",              "Cypress Hills St & 78th Ave, Queens, NY",
+  "Metropolitan Ave",        "Metropolitan Ave & 69th St, Queens, NY",
+  "Eliot Ave",               "Eliot Ave & 69th St, Queens, NY",
+  "Grand Ave",               "Grand Ave & 69th St, Queens, NY",
+  "Roosevelt Ave",           "Roosevelt Ave & 74th St, Queens, NY"
+)
+
+# 3. Geocode the addresses into Lat/Long coordinates
+ibx_geocoded <- ibx_stations %>%
+  geocode(address, method = 'osm', lat = latitude, long = longitude) %>%
+  drop_na() %>% # Drop any that the open-source map couldn't perfectly match
+  
+  # Convert the GPS coordinates into an active spatial (sf) object
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326) %>%
+  
+  # Convert to NYC's specific projection (feet) to draw a perfect 0.5 mile circle
+  st_transform(2263) %>%
+  st_buffer(dist = 2640) %>% # 2640 feet = 0.5 miles (The 10-minute walkshed)
+  st_transform(4326) # Convert back to standard GPS
+
+# 4. Find all Census Tracts that fall inside these new station walksheds
+# We use st_transform to mathematically force the stations to match the census map's CRS
+ibx_tracts_sf <- st_filter(
+  nyc_tracts, 
+  st_transform(ibx_geocoded, st_crs(nyc_tracts)), 
+  .predicate = st_intersects
+)
+
+# Extract just the 11-digit IDs as a clean list
+ibx_geoid_list <- ibx_tracts_sf$GEOID
+
+# 5. Create the "Alternative Universe" Dataset
+# Find the Z-score that mathematically represents "right next to a subway entrance"
+best_transit_z_score <- min(ml_data$dist_subway_miles)
+
+ibx_scenario_data <- ml_data %>%
+  mutate(
+    # Inject that "perfect" transit score into the IBX tracts
+    dist_subway_miles = ifelse(GEOID %in% ibx_geoid_list, best_transit_z_score, dist_subway_miles)
+  )
+
+# 6. Run the Predictions & Calculate the Surge
+final_map_data <- ml_data %>%
+  mutate(
+    predicted_bike_baseline = predict(lm_fit_standardized, newdata = ml_data),
+    predicted_bike_ibx      = predict(lm_fit_standardized, newdata = ibx_scenario_data),
+    ibx_adoption_surge      = predicted_bike_ibx - predicted_bike_baseline
+  )
+
+# Save the final data so your Shiny App can map it instantly!
+saveRDS(final_map_data, file.path(projPath, "data", "model_input.rds"))
+```
+
+```{r model-outputs}
+# Load broom for tidy model outputs (dotwhisker removed since you built a great custom ggplot!)
+pacman::p_load(broom)
+
+# Turn the STANDARDIZED model results into a clean table
+lm_results <- tidy(lm_fit_standardized) %>%
   filter(term != "(Intercept)") # Remove the intercept for better scaling
 
 # Plot the "Pull" of each feature
@@ -645,9 +820,9 @@ ggplot(lm_results, aes(x = estimate, y = reorder(term, estimate))) +
   geom_point(size = 3, color = "darkblue") +
   geom_errorbarh(aes(xmin = estimate - std.error, xmax = estimate + std.error), height = 0.2) +
   theme_minimal() +
-  labs(title = "Linear Model: What drives the 'Bike Index'?",
-       subtitle = "Points to the right increase biking; points to the left decrease it.",
-       x = "Estimate (Coefficient)",
+  labs(title = "Feature Importance: What drives the 'Bike Index'?",
+       subtitle = "Standardized Coefficients (Variables further from 0 have a stronger impact)",
+       x = "Effect on Bike Index (per 1 Std. Dev. increase)",
        y = "Feature")
 ```
 
