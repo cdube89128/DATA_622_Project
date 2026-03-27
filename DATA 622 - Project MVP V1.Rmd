@@ -794,14 +794,15 @@ ibx_scenario_data <- ml_data %>%
     dist_subway_miles = ifelse(GEOID %in% ibx_geoid_list, best_transit_z_score, dist_subway_miles)
   )
 
-# 6. Run the Predictions & Calculate the Surge
+# 6. Run the Predictions, Calculate Surge, AND Flag Station Locations
 final_map_data <- ml_data %>%
   mutate(
     predicted_bike_baseline = predict(lm_fit_standardized, newdata = ml_data),
     predicted_bike_ibx      = predict(lm_fit_standardized, newdata = ibx_scenario_data),
-    ibx_adoption_surge      = predicted_bike_ibx - predicted_bike_baseline
+    ibx_adoption_surge      = predicted_bike_ibx - predicted_bike_baseline, 
+    is_ibx_location         = ifelse(GEOID %in% ibx_geoid_list, 1, 0)
   )
-
+ 
 # Save the final data so your Shiny App can map it instantly!
 saveRDS(final_map_data, file.path(projPath, "data", "model_input.rds"))
 ```

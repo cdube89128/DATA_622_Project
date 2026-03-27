@@ -19,31 +19,27 @@ map_data <- geo_data %>%
 # 2. USER INTERFACE (UI)
 # ==============================================================================
 ui <- fluidPage(
-  titlePanel("NYC Commute Burden & IBX Sensitivity Analysis"),
+  titlePanel("NYC Micromobility & IBX Sensitivity Analysis"),
   
   sidebarLayout(
     sidebarPanel(
       h4("Map Controls"),
-      p("Select a layer below to explore current commute times, transit dependency, or the predictive impact of building the Interborough Express (IBX)."),
+      p("Select a layer below to explore current demographics, or view the predictive impact of building the Interborough Express (IBX)."),
       
       # Grouped dropdown for a super clean UI
       selectInput("map_var", "Select Map Layer:",
                   choices = list(
-                    "🚆 IBX Impact on Commutes (Predictions)" = c(
-                      "Predicted 60m+ Commutes (Current)" = "predicted_commute_baseline",
-                      "Predicted 60m+ Commutes (With IBX)" = "predicted_commute_ibx",
-                      "IBX Commute Relief (Net % Drop)"    = "ibx_commute_relief"
+                    "🤖 IBX Sensitivity Analysis (Model Predictions)" = c(
+                      "Predicted Biking (Current Baseline)" = "predicted_bike_baseline",
+                      "Predicted Biking (With IBX Built)"   = "predicted_bike_ibx",
+                      "The IBX Surge (Net Adoption Delta)"  = "ibx_adoption_surge"
                     ),
-                    "⏱️ Current Transit Reality" = c(
-                      "Actual % of 60m+ Commutes"     = "pct_commute_60p",
-                      "IBX Station Walksheds (0.5mi)" = "is_ibx_location",
-                      "Distance to Subway (Miles)"    = "dist_subway_miles"
-                    ),
-                    "🚕 Transit Alternatives (Predictors)" = c(
-                      "Uber/Taxi Trips per Capita"  = "uber_trips_per_capita",
-                      "Citi Bike Trips per Capita"  = "bike_trips_per_capita",
-                      "Citi Bike Stations Density"  = "stations_per_sq_mile",
-                      "Stations per 1000 Residents" = "stations_per_1000_pop"
+                    "🚲 Target & Infrastructure" = c(
+                      "Actual Bike Preference Index"   = "bike_index",
+                      "Distance to Subway (Miles)"     = "dist_subway_miles",
+                      "IBX Station Locations (Added)"  = "is_ibx_location",
+                      "Stations per Sq Mile (Density)" = "stations_per_sq_mile",
+                      "Stations per 1000 Residents"    = "stations_per_1000_pop"
                     ),
                     "🏙️ Economics & Housing" = c(
                       "Median Income"        = "med_income",
@@ -51,17 +47,18 @@ ui <- fluidPage(
                       "% Renter Occupied"    = "pct_renter",
                       "% Vacant Housing"     = "pct_vacant"
                     ),
-                    "🚶 Demographics" = c(
-                      "% No Car"        = "pct_no_car",
-                      "% Transit Users" = "pct_transit",
-                      "% Age 18-24"     = "pct_age_18_24",
-                      "% Age 25-34"     = "pct_age_25_34",
-                      "% Age 65+"       = "pct_age_65_plus"
+                    "🚶 Demographics & Commute" = c(
+                      "% No Car"                 = "pct_no_car",
+                      "% Transit Users"          = "pct_transit",
+                      "% Extreme Commute (60m+)" = "pct_commute_60p",
+                      "% Age 18-24"              = "pct_age_18_24",
+                      "% Age 25-34"              = "pct_age_25_34",
+                      "% Age 65+"                = "pct_age_65_plus"
                     )
                   )),
       
       hr(),
-      helpText("Data Sources: 2022 ACS (5-Year), TLC Trip Records (Oct 2023), Citi Bike Trip Data (Oct 2023), MTA SEQRA Scoping (2025).")
+      helpText("Data Sources: 2022 ACS (5-Year), TLC Trip Records (Oct 2023), Citi Bike Trip Data (Oct 2023).")
     ),
     
     mainPanel(
@@ -70,7 +67,6 @@ ui <- fluidPage(
     )
   )
 )
-
 # ==============================================================================
 # 3. SERVER LOGIC
 # ==============================================================================
@@ -78,25 +74,24 @@ server <- function(input, output, session) {
   
   # A simple dictionary to translate variable names to clean Legend Titles
   legend_titles <- c(
-    "predicted_commute_baseline" = "Predicted 60m+ Commute",
-    "predicted_commute_ibx"      = "Predicted 60m+ Commute (IBX)",
-    "ibx_commute_relief"         = "IBX Relief (Time Saved)",
-    "pct_commute_60p"            = "% Extreme Commute (Actual)",
-    "is_ibx_location"            = "IBX Station Area",
-    "dist_subway_miles"          = "Subway Distance (Miles)",
-    "uber_trips_per_capita"      = "Uber/Taxi per Capita",
-    "bike_trips_per_capita"      = "Bike Trips per Capita",
-    "stations_per_sq_mile"       = "Bike Stations per Sq Mi",
-    "stations_per_1000_pop"      = "Stations per 1000 Residents",
-    "med_income"                 = "Median Income ($)",
-    "pct_poverty"                = "% Below Poverty",
-    "pct_renter"                 = "% Renter Occupied",
-    "pct_vacant"                 = "% Vacant Housing",
-    "pct_no_car"                 = "% No Car",
-    "pct_transit"                = "% Transit Users",
-    "pct_age_18_24"              = "% Age 18-24",
-    "pct_age_25_34"              = "% Age 25-34",
-    "pct_age_65_plus"            = "% Age 65+"
+    "predicted_bike_baseline" = "Predicted Biking (Baseline)",
+    "predicted_bike_ibx"      = "Predicted Biking (With IBX)",
+    "ibx_adoption_surge"      = "IBX Surge (Net Delta)",
+    "is_ibx_location"         = "IBX Station Walksheds (0.5mi)",
+    "bike_index"              = "Bike Preference Index",
+    "dist_subway_miles"       = "Distance to Subway (Miles)",
+    "stations_per_sq_mile"    = "Stations per Sq Mile",
+    "stations_per_1000_pop"   = "Stations per 1000 Residents",
+    "med_income"              = "Median Income ($)",
+    "pct_poverty"             = "% Below Poverty",
+    "pct_renter"              = "% Renter Occupied",
+    "pct_vacant"              = "% Vacant Housing",
+    "pct_no_car"              = "% No Car",
+    "pct_transit"             = "% Transit Users",
+    "pct_commute_60p"         = "% 60m+ Commute",
+    "pct_age_18_24"           = "% Age 18-24",
+    "pct_age_25_34"           = "% Age 25-34",
+    "pct_age_65_plus"         = "% Age 65+"
   )
   
   # Initialize the Base Map (This only draws once so it stays fast)
@@ -111,8 +106,9 @@ server <- function(input, output, session) {
     selected_var <- input$map_var
     var_data <- map_data[[selected_var]]
     
-    # 1. FORMATTING FIX: Append % for commute and percentage metrics (No multiplication needed)
-    if (grepl("pct_", selected_var) || grepl("commute", selected_var)) {
+    # 1. FORMATTING FIX: Convert decimals to percentages for the bike metrics
+    if (selected_var %in% c("bike_index", "predicted_bike_baseline", "predicted_bike_ibx", "ibx_adoption_surge")) {
+      var_data <- var_data * 100
       suffix_symbol <- "%"
     } else {
       suffix_symbol <- ""
@@ -122,12 +118,10 @@ server <- function(input, output, session) {
     if (selected_var == "is_ibx_location") {
       # Use a distinct color (like bright Blue) for the stations vs grey for everywhere else
       pal <- colorFactor(c("#e0e0e0", "#0072B2"), domain = c(0, 1))
-    } else if (selected_var == "ibx_commute_relief") {
-      # Green palette for relief/improvement (Time saved is a good thing!)
-      pal <- colorNumeric("YlGn", domain = var_data)
     } else if (selected_var == "dist_subway_miles") {
-      # Reversed so closer = darker
       pal <- colorNumeric("magma", domain = var_data, reverse = TRUE)
+    } else if (selected_var == "ibx_adoption_surge") {
+      pal <- colorNumeric("YlGn", domain = var_data)
     } else {
       pal <- colorNumeric("magma", domain = var_data)
     }
@@ -154,7 +148,7 @@ server <- function(input, output, session) {
         values = var_data,
         title = legend_titles[[selected_var]], 
         opacity = 0.7,
-        # The transform function safely rounds the numbers in the legend
+        # The transform function completely bypasses Leaflet's stubborn rounding bug
         labFormat = labelFormat(suffix = suffix_symbol, transform = function(x) round(x, 1))
       )
   })
