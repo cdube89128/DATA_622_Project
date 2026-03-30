@@ -30,14 +30,15 @@ pacman::p_load(
    dplyr,
    knitr,
    janitor, # clean up the names of columns that have spaces (subway entrances data)
-   tidygeocoder
+   tidygeocoder,
+   broom
 )
 projPath <- dirname(file.path(getSourceEditorContext()$path))
 
 ```
 
 
-# Modeling Citi Bike vs. Rideshare Usage in NYC
+# Modeling the Impact of the IBX on 60minute+ commute times 
 
 ## Foundation 
 
@@ -51,14 +52,10 @@ Picked 2022 because:
 * The 5-Year ACS helps avoid the 2020 collection gap (where due to COVID, the Census Bureau couldn't send people door to door) and the 2021 remote-forward living arrangements, where many people left Manhattan during the high period of remote work.
 * The 5-year estimate is a rolling average (2018–2022), and some COVID-impacted data is included either way. However, multiple years of more robust data are included in this time window.
 
-Why is this data important?
+Another option would be to switch to the most recent census data available, but it's worth noting that that won't avoid the COVID data being included in the 5 -year estimate.
 
-* The census data provides **Feature variables** that describe what New Yorkers looked like in a given region. These are inputs. 
 
-**REVISIT ME:** 
-
-* Currently: looking at vehicle availability, household income, age, and population size.
-* Future: probably want to comb through other features of interest from the census data. Potentially look at feature engineering, and at normalizing or standardizing the features as needed.
+#### Current Vars from census
 
 ```{r acquire-census-data} 
 
@@ -82,8 +79,10 @@ feature_exploration <- acs_vars_2022 %>%
 #View(feature_exploration)
 ```
 
-```{r more-census-data}
-# Define all API variables explicitly  
+```{r more-census-data, results='hide', message=FALSE, cache=TRUE}
+# hiding the results of this chunk becuase it jsut is unreadable in the knitted document
+
+# Census variables
 vars <- c(
   # Base Demographics
   no_car      = "B08201_002", 
@@ -98,6 +97,7 @@ vars <- c(
   wfh         = "B08301_021",
   
   # Travel Time Features
+  # Potential target variable
   commute_60  = "B08303_012",
   commute_90  = "B08303_013",
   
@@ -151,6 +151,38 @@ nyc_tracts <- get_acs(
 )
 
 ```
+#### Feature Engineering Census Data
+
+This chunk does an explicit selection of columns from the census data to start with. (There are just so many features in that data that clearly selecting and renaming when applicable seemed like a cleaner route.)
+
+After that this chunk is doing some feature engineering on the census data. Mostly turning raw count data into percent of population data.
+
+* `pct_commute_60p` is currently being used as the target variable. It's the count of people with commutes over 60 min + the count of people with commutes over 90 minutes. Divided by total number of workers. x 100 to make is a percentage.
+* `pct_no_car` is percent of people who do not have a car 
+* `pct_transit` is percent of workers using public transit (mta, buses **not** uber/taxi) as primary commute methos 
+* `pct_walk` is percent of workers using walking as primary commute method
+* `pct_wfh`is percent of workers working from home 
+* `pct_bachelors` is the percent of 25+ year olds with Bachelor's Degrees or higher
+* Occupation buckets
+ * `pct_mngmt` is percent of workers in management, business, science, and arts
+ * `pct_service` is percent of workers in 
+ * `pct_sales` is percent of workers in sales and office administration
+ * `pct_const` is percent of workers in natural resources, construction, and maintenance
+ * `pct_trans` is percent of workers in production, transportation, and material moving
+* `area_sq_miles` is the area in square miles
+* `pop_density`is the numebr of people per square mile
+* Age GRoups
+ * I didn't want to bucket the ages because I know having continuous data is better, but unfortuantely the census already had some underlying bucketing
+ * `pct_age_18_24` is the percent of the population in that age range
+ * `pct_age_25_34` is the percent of the population in that age range
+ * `pct_age_35_44` is the percent of the population in that age range
+ * `pct_age_45_64` is the percent of the population in that age range
+ * `pct_age_65_plus` is the percent of the population in that age range
+* `pct_vacant` is the percent of housing that is vacant
+* `pct_renter` is the percent of occupued units that are being rented
+* `pct_poverty` is the percent of people living below the poverty line out of the total population for whom poverty status is determined
+    
+Not all of the engineered features are used in the later model.
 
 ```{r feature-engineering-census-data}
 nyc_tracts <- nyc_tracts %>%
@@ -182,14 +214,14 @@ nyc_tracts <- nyc_tracts %>%
     const_job   = const_jobE, 
     trans_job   = trans_jobE,
     
-    # Age - Males
+    # Age - Male
     m_18_19 = m_18_19E, m_20 = m_20E, m_21 = m_21E, m_22_24 = m_22_24E,
     m_25_29 = m_25_29E, m_30_34 = m_30_34E,
     m_35_39 = m_35_39E, m_40_44 = m_40_44E,
     m_45_49 = m_45_49E, m_50_54 = m_50_54E, m_55_59 = m_55_59E, m_60_61 = m_60_61E, m_62_64 = m_62_64E,
     m_65_66 = m_65_66E, m_67_69 = m_67_69E, m_70_74 = m_70_74E, m_75_79 = m_75_79E, m_80_84 = m_80_84E, m_85_up = m_85_upE,
     
-    # Age - Females
+    # Age - Female
     f_18_19 = f_18_19E, f_20 = f_20E, f_21 = f_21E, f_22_24 = f_22_24E,
     f_25_29 = f_25_29E, f_30_34 = f_30_34E,
     f_35_39 = f_35_39E, f_40_44 = f_40_44E,
@@ -249,6 +281,8 @@ nyc_tracts <- nyc_tracts %>%
   )
 ```
 
+#### Checking for missing census data
+
 ```{r census-missing-data-exploration}
 ## Checking for total NAs and NaNs in each column
 colSums(is.na(nyc_tracts %>% st_drop_geometry())) %>%
@@ -274,7 +308,6 @@ missing_summary <- nyc_tracts %>%
 # Output Percentage of Missing Data
 kable(missing_summary, digits = 2, caption = "Missing Data Percentage by Feature")
 
-
 ## Map for missing income data
 missing_map_data <- nyc_tracts %>%
   mutate(missing_income_flag = ifelse(is.na(med_income), "Missing Data", "Valid Data"))
@@ -287,6 +320,12 @@ ggplot(missing_map_data) +
        fill = "Status") 
 ```
 
+#### Census NA Handling
+
+This chunk is currently dropping census tracts that have very few people or no workers.
+
+It's also **imputing** where income or age was missing using the median value. This was just a simple implementation, but we can definitely consider more robust imputing methos, and also properly investingating MAR, MNAR etc. (Though given the nature of census data, MNAR is a good assumption.)
+
 ```{r census-na-handling}
 ## Drop tracts with less than 50 people or 0 workers
 # There were a ton of tracts with a small number of or 0 people, screwing with denominators and also making for super volatile percentages
@@ -295,11 +334,10 @@ nyc_tracts_clean <- nyc_tracts %>%
 
 ## Imputing
 # There were also many tracts where income or age was missing, but it wasn't due to a denominator issue
-## RETURN HERE
-## Just doing simple median imputation
-## More robust method would be better
-## Checking for MNAR and stuff would be better
-# Right now
+# Just doing simple median imputation
+# More robust method would be better
+# Checking for MNAR and stuff would be better
+# The current median imputation: 
 nyc_tracts_clean <- nyc_tracts_clean %>%
   # Extract the borough from the NAME string (e.g., "Queens County")
   mutate(borough = str_extract(NAME, "(?<=; ).*(?= County)")) %>%
@@ -337,6 +375,8 @@ head(nyc_tracts_clean)
 
 ### Taxi Zones
 
+The taxi zone data is luckily pretty straightforward. It's just being imported here.
+
 ```{r taxi-zones}  
 #Zip file from below url is downloaded and extracted into repo
 #taxi_zones_url <- "https://d37ci6vzurychx.cloudfront.net/misc/taxi_zones.zip" 
@@ -371,11 +411,7 @@ High volume for hire vehicles = Uber/Lyft.
  * https://d37ci6vzurychx.cloudfront.net/trip-data/fhv_tripdata_2023-10.parquet
  * https://d37ci6vzurychx.cloudfront.net/trip-data/fhvhv_tripdata_2023-10.parquet 
 
-**REVISIT ME:** 
 
-* Currently:   
-* Future:  
- 
 ```{r acquire-october-2023-tlc} 
 ## Aggregate all vehicular trips for October 2023
 # Combine Yellow, Green, FHV, and High-Volume FHV (Uber/Lyft) 
@@ -408,19 +444,20 @@ total_zone_counts <- tlc_urls %>%
 
 ### Census uses Tracts, TLC uses Taxi Zones
 
-The question here is how much of each Census Tract sits inside which Taxi Zone?
+So Census Tracts are not the same as Taxi Zones. This chunk tries to handle it.
 
-This uses EPSG:2263 which uses the units of "feet", and can be used to calculate the square footage of an area in NY more precisely.
+**EPSG:2263** is apparently a specific map projection built just for the New York/Long Island area. In it, 1 unit equals exactly 1 physical foot. (I had not ever used this before.) The idea is that if the censues tracts and the taxi zones are both transformed to EPSG:2263, then this will be the most precise way to layer these maps on top of one another and see where they intersect. (At least it appears to be more precise than using latitude and longitude.)
+
+`st_intersection()` lays the two maps on top of one another and separated out the overlapping pieces properly.
 
 ```{r} 
-# Use Coordinate Reference System (CRS)
-# We'll use EPSG:2263 (NAD83 / New York Long Island) because it uses feet,
-# which is much better for calculating area in NYC than Lat/Long.
+# Coordinate Reference System (CRS)
+# EPSG:2263 (NAD83 / New York Long Island) uses feet 
 nyc_tracts_proj <- st_transform(nyc_tracts, 2263)
 taxi_zones_proj <- st_transform(taxi_zones, 2263)
 
 # Intersect regions
-# This creates a new set of shapes where tracts and zones overlap
+# This creates a new spacial dataframe where tracts and zones overlap
 intersection <- st_intersection(nyc_tracts_proj, taxi_zones_proj) %>%
   mutate(intersect_area = st_area(.))
 
@@ -439,14 +476,10 @@ tract_weights <- intersection %>%
 head(tract_weights)
 ```
 
+The below chunk uses the newly defined geography, and then it disperses the uber/taxi trip data (which uses taxi zones) fairly across the census tracts.  
  
 ```{r}
-
-# 'Spatial Weights' / Crosswalk
-# issue is that taxi zones are larger than census tracts, and we obvs want to use the data together
-# 
-# WHY: Taxi Zones are larger than Census Tracts. We use the weights from Phase 1
-# to distribute these trips into our Census Tracts (GEOIDs).
+# issue is that taxi zones are larger than census tracts, and we obvs want to use the data together 
 # Assumes 'tract_weights' object exists from your earlier step.
 
 tract_vehicular_estimates <- tract_weights %>%
@@ -470,7 +503,6 @@ print(paste("Vehicular trip estimates for October 2023 saved to:", save_path_tlc
   * 202601-citibike-tripdata_1.csv
   * 202601-citibike-tripdata_2.csv
 * Currently pulling **October 2023** data  
-  * 
 
 
 ```{r citi-bike-to-census-tract }
@@ -551,12 +583,10 @@ subway_raw <- read_csv(subway_csv_path) %>%
   clean_names() # otherwise this had spaces in the column names
 
 # Transform into a Spatial Object (sf)
-# 'entrance_longitude' is X and 'entrance_latitude' is Y
-# 4326 is the standard GPS system (WGS84)
 subway_entrances_sf <- subway_raw %>%
-  filter(!is.na(entrance_latitude) & !is.na(entrance_longitude)) %>%
-  st_as_sf(coords = c("entrance_longitude", "entrance_latitude"), crs = 4326) %>%
-  st_transform(2263) # Convert to NYC Feet to match our Census Tracts
+  filter(!is.na(entrance_latitude) & !is.na(entrance_longitude)) %>% # 'entrance_longitude' is X and 'entrance_latitude' is Y
+  st_as_sf(coords = c("entrance_longitude", "entrance_latitude"), crs = 4326) %>% # telling it to read this as 4326, the standard GPS coordinate system  
+  st_transform(2263) # Converting to the same 1 unit = 1 foot NYC-specific map that was used earlier
 
 # Centroids
 # Find the center point of every Census Tract
@@ -564,6 +594,7 @@ tract_centers <- st_centroid(nyc_tracts_proj)
 
 # Nearest Entrance for every Tract
 # Find the closest subway for each tract
+# Doing this from the tract center 
 nearest_indices <- st_nearest_feature(tract_centers, subway_entrances_sf)
 
 # Distance in Miles
@@ -649,7 +680,7 @@ print("Master Join Complete. The model_input.rds file is ready for modeling.")
 
 ### Intermediate Sanity Checking
 
-
+We could drop this later, but right now it was just a helpful way to make sure that combining the census tracts and the taxi zones worked properly.
 
 ```{r data-audit}
 ### The Data Audit (Sanity Check)
@@ -683,60 +714,49 @@ print(top_uber)
 
 ## Model Building (Super Duper Rough, Proof of Concept)
 
-It's late in the evening, so I just did a quick AI pass at this with a linear model for proof of concept.
+This is currently a simple linear model for proof of concept. We'll be able to build up something much more robust .
 
-###
+### Model 1
+
+`ml_data` is selecting the features to go into the model. A very very simple model is happening here. We need ot implement train-test and better model selection still.
 
 ```{r machine-learning-poc}
-# 1. Prepare and Standardize the Data
+# The selection for the Machine Learning model
+# Right now, this has a lot of room for improvement trimming or adding features
 ml_data <- readRDS(file.path(projPath, "data", "model_input.rds")) %>%
   select(
-    GEOID, # <--- WE ADD GEOID BACK HERE
+    GEOID,  
+    # NEW TARGET:
+    pct_commute_60p, 
     
-    # Target
-    bike_index, 
-    
-    # Scaled Infrastructure Controls
+    # Predictors
     stations_per_sq_mile, stations_per_1000_pop, dist_subway_miles, 
-    
-    # Economic & Housing Controls
     med_income, pct_poverty, pct_vacant, pct_renter, 
-    
-    # Demographic & Commuter Behaviors
-    pop_density, pct_no_car, pct_transit, pct_commute_60p, pct_bachelors,
-    
-    # Continuous Age Spectrum
+    pop_density, pct_no_car, pct_transit, pct_bachelors,
     pct_age_18_24, pct_age_25_34, pct_age_35_44, pct_age_45_64, pct_age_65_plus
   ) %>%
   drop_na() %>%
   
-  # Standardize all predictors 
-  # We deliberately exclude BOTH our target (bike_index) and our ID (GEOID) from scaling
   mutate(across(
-    .cols = -c(bike_index, GEOID), 
+    .cols = -c(pct_commute_60p, GEOID), 
     .fns = ~ as.numeric(scale(.))
   ))
 
-# 2. Fit the "Kitchen Sink" Model
-# The minus sign (- GEOID) explicitly tells the model NOT to use the ID as a predictor
-lm_fit_standardized <- lm(bike_index ~ . - GEOID, data = ml_data)
+# Fit the model against the Commute Rate
+lm_fit_standardized <- lm(pct_commute_60p ~ . - GEOID, data = ml_data)  # The minus sign (- GEOID) explicitly means don't use ID as a predictor 
 
-# 3. Fit the "George MVP" Simple Model
-lm_fit_simple <- lm(bike_index ~ dist_subway_miles, data = ml_data)
- 
-# View the Coefficients
-print("--- SIMPLE MVP MODEL ---")
-summary(lm_fit_simple)
-
-print("--- FULL STANDARDIZED MODEL ---")
+print("Model Summary: ")
 summary(lm_fit_standardized)
 ```
 
-```{r ibx-simulator}
-# 1. Load the geocoding package
-pacman::p_load(tidygeocoder, sf, dplyr)
+### IBX Simulation
 
-# 2. Build the list of stations based on the MTA's 2025 CE Document
+Here, the approximate locations of the new IBX stations are being brought in. And then in the census areas where they go, we're basically dropping the distance to train for those areas to really low. There may be a more robust way of implementing the "simulation" of the IBX station than this, but this seemed like a good starting point.
+
+```{r ibx-simulator-data} 
+
+# Build the list of stations based on the MTA's 2025 CE Document
+# This document is a pdf, and can be found in the repo
 ibx_stations <- tibble::tribble(
   ~station_name,             ~address,
   "Brooklyn Army Terminal",  "2nd Ave & 61st St, Brooklyn, NY",
@@ -760,21 +780,20 @@ ibx_stations <- tibble::tribble(
   "Roosevelt Ave",           "Roosevelt Ave & 74th St, Queens, NY"
 )
 
-# 3. Geocode the addresses into Lat/Long coordinates
+# Geocode the addresses into Lat/Long coordinates
 ibx_geocoded <- ibx_stations %>%
-  geocode(address, method = 'osm', lat = latitude, long = longitude) %>%
+  geocode(address, method = 'osm', lat = latitude, long = longitude) %>% # get coordinated for each address
   drop_na() %>% # Drop any that the open-source map couldn't perfectly match
   
-  # Convert the GPS coordinates into an active spatial (sf) object
+  # Convert the GPS coordinates into an sf object
   st_as_sf(coords = c("longitude", "latitude"), crs = 4326) %>%
   
-  # Convert to NYC's specific projection (feet) to draw a perfect 0.5 mile circle
-  st_transform(2263) %>%
-  st_buffer(dist = 2640) %>% # 2640 feet = 0.5 miles (The 10-minute walkshed)
+  # Convert and draw 10-minute-walk-radiuses 
+  st_transform(2263) %>% # transform to the more precide NYC + Long Island map we've been using
+  st_buffer(dist = 2640) %>% # drawing a circle around point that is 2640 feet = 0.5 miles ~ 10 minute walk. Most people don't want to walk further than 10 minutes to the train
   st_transform(4326) # Convert back to standard GPS
 
-# 4. Find all Census Tracts that fall inside these new station walksheds
-# We use st_transform to mathematically force the stations to match the census map's CRS
+# Find all Census Tracts that fall at least partially inside these new 10-minute-walk-radiuses 
 ibx_tracts_sf <- st_filter(
   nyc_tracts, 
   st_transform(ibx_geocoded, st_crs(nyc_tracts)), 
@@ -783,57 +802,50 @@ ibx_tracts_sf <- st_filter(
 
 # Extract just the 11-digit IDs as a clean list
 ibx_geoid_list <- ibx_tracts_sf$GEOID
+```
 
-# 5. Create the "Alternative Universe" Dataset
-# Find the Z-score that mathematically represents "right next to a subway entrance"
+```{r ibx-simulator-dataset-and-model}
+## Create an IBX UNIVERSE data set
+# finding the Census Tract in NYC that is physically closest to a subway entrance
+# going to use this later to simulate a really close distance to subway for places where IBX is being built
 best_transit_z_score <- min(ml_data$dist_subway_miles)
 
 ibx_scenario_data <- ml_data %>%
   mutate(
-    # Inject that "perfect" transit score into the IBX tracts
+    # Inject best_transit_z_score into the IBX tracts
     dist_subway_miles = ifelse(GEOID %in% ibx_geoid_list, best_transit_z_score, dist_subway_miles)
   )
 
-# 6. Run the Predictions, Calculate Surge, AND Flag Station Locations
+# Predict and flag new IBX station locations 
 final_map_data <- ml_data %>%
   mutate(
-    predicted_bike_baseline = predict(lm_fit_standardized, newdata = ml_data),
-    predicted_bike_ibx      = predict(lm_fit_standardized, newdata = ibx_scenario_data),
-    ibx_adoption_surge      = predicted_bike_ibx - predicted_bike_baseline, 
-    is_ibx_location         = ifelse(GEOID %in% ibx_geoid_list, 1, 0)
+    predicted_commute_baseline = predict(lm_fit_standardized, newdata = ml_data),
+    predicted_commute_ibx      = predict(lm_fit_standardized, newdata = ibx_scenario_data), 
+    ibx_commute_relief         = predicted_commute_baseline - predicted_commute_ibx,
+    is_ibx_location            = ifelse(GEOID %in% ibx_geoid_list, 1, 0)
   )
- 
-# Save the final data so your Shiny App can map it instantly!
+
 saveRDS(final_map_data, file.path(projPath, "data", "model_input.rds"))
 ```
 
-```{r model-outputs}
-# Load broom for tidy model outputs (dotwhisker removed since you built a great custom ggplot!)
-pacman::p_load(broom)
+```{r model-outputs} 
 
-# Turn the STANDARDIZED model results into a clean table
+# Model Results
 lm_results <- tidy(lm_fit_standardized) %>%
   filter(term != "(Intercept)") # Remove the intercept for better scaling
 
-# Plot the "Pull" of each feature
+# Plot the "Pull" or "Impact" of each feature
 ggplot(lm_results, aes(x = estimate, y = reorder(term, estimate))) +
   geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
   geom_point(size = 3, color = "darkblue") +
   geom_errorbarh(aes(xmin = estimate - std.error, xmax = estimate + std.error), height = 0.2) +
   theme_minimal() +
-  labs(title = "Feature Importance: What drives the 'Bike Index'?",
+  labs(title = "What's driving 60 minute + length communtes?",
        subtitle = "Standardized Coefficients (Variables further from 0 have a stronger impact)",
-       x = "Effect on Bike Index (per 1 Std. Dev. increase)",
+       x = "Effect on 60+ Minute Commute Rate (per 1 Std. Dev. increase)",
        y = "Feature")
 ```
 
 ## Misc. Notes Dump
-
-The "Hybrid" Workflow (The Pro Move)
-Since you are using GitHub, here is how you should structured your work:
-
-data_prep.Rmd: Use this to join the Census data, TLC data, and Citi Bike data. At the end of this file, use write_rds(final_data, "data/model_input.rds").
-
-app.R: This file should be very "slim." It just reads model_input.rds, runs the ML prediction, and shows the map.
-
-Analogy: data_prep.Rmd is the kitchen where you chop the vegetables; app.R is the dining table where the customer sees the finished meal. You don't want the customer sitting in the middle of the kitchen! 
+ 
+nothing right now.
