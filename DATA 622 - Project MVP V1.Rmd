@@ -663,12 +663,13 @@ master_table <- master_table %>%
     # Per Capita Availability (Stations per 1,000 Residents)
     # How much infrastructure exists relative to the local population size?
     stations_per_1000_pop = (total_stations / total_pop) * 1000,
+    uber_trips_per_capita = total_uber_taxi_trips / total_pop,
+    bike_trips_per_capita = total_bike_trips / total_pop,
     
-    # CALCULATE THE TARGET: % of Last-Mile trips taken by Bike
+    # Old target: % of Last-Mile trips taken by Bike
+    # I left this in here, but we aren't really using it now
     bike_index = total_bike_trips / (total_bike_trips + total_uber_taxi_trips)
-  ) %>%
-  # Filter out tracts with 0 total trips to avoid "Divided by Zero" errors
-  filter(!is.na(bike_index))
+  )  
 
 # Save joined data set
 saveRDS(master_table, file.path(projPath, "data", "model_input.rds"))
@@ -718,35 +719,51 @@ This is currently a simple linear model for proof of concept. We'll be able to b
 
 ### Model 1
 
-`ml_data` is selecting the features to go into the model. A very very simple model is happening here. We need ot implement train-test and better model selection still.
+`ml_data` is selecting the features to go into the model. A very very simple model is happening here. We need to implement train-test and better model selection still.
 
 ```{r machine-learning-poc}
 # The selection for the Machine Learning model
-# Right now, this has a lot of room for improvement trimming or adding features
-ml_data <- readRDS(file.path(projPath, "data", "model_input.rds")) %>%
-  select(
-    GEOID,  
-    # NEW TARGET:
-    pct_commute_60p, 
-    
-    # Predictors
-    stations_per_sq_mile, stations_per_1000_pop, dist_subway_miles, 
-    med_income, pct_poverty, pct_vacant, pct_renter, 
-    pop_density, pct_no_car, pct_transit, pct_bachelors,
-    pct_age_18_24, pct_age_25_34, pct_age_35_44, pct_age_45_64, pct_age_65_plus
-  ) %>%
-  drop_na() %>%
+# Right now, this has a lot of room for improvement trimming or adding features 
+
+# To make iteration easier:
+##  COLUMN/FEATURE SELECTION
+id_vars <- c("GEOID")
+target_var <- c("pct_commute_60p")
+
+predictor_vars <- c(
+  # Infrastructure & Mobility
+  "stations_per_sq_mile", "stations_per_1000_pop", "dist_subway_miles", 
+  "uber_trips_per_capita", "bike_trips_per_capita",
   
+  # Economic & Housing
+  "med_income", "pct_poverty", "pct_vacant", "pct_renter", 
+  
+  # Demographics & Commute Behaviors
+  "pop_density", "pct_no_car", "pct_transit", "pct_bachelors", "pct_wfh", "pct_walk",
+  
+  # Age Buckets
+  "pct_age_18_24", "pct_age_25_34", "pct_age_35_44", "pct_age_45_64", "pct_age_65_plus"
+)
+
+## SAVING RAW (NON-Z-SCORE) DATA TO DISPLAY IN SHINY APP
+ml_data_raw <- readRDS(file.path(projPath, "data", "model_input.rds")) %>%
+  # all_of() safely selects only the columns defined in our lists above
+  select(all_of(c(id_vars, target_var, predictor_vars))) %>%
+  drop_na()
+
+## SCALE THE DATA FOR THE MODEL
+ml_data_scaled <- ml_data_raw %>%
   mutate(across(
-    .cols = -c(pct_commute_60p, GEOID), 
+    .cols = all_of(predictor_vars), # ONLY scale the predictors!
     .fns = ~ as.numeric(scale(.))
   ))
 
-# Fit the model against the Commute Rate
-lm_fit_standardized <- lm(pct_commute_60p ~ . - GEOID, data = ml_data)  # The minus sign (- GEOID) explicitly means don't use ID as a predictor 
+## TRAIN THE MODEL
+# Train the model using the SCALED data
+lm_fit_standardized <- lm(pct_commute_60p ~ . - GEOID, data = ml_data_scaled)
 
 print("Model Summary: ")
-summary(lm_fit_standardized)
+summary(lm_fit_standardized) 
 ```
 
 ### IBX Simulation
@@ -808,24 +825,25 @@ ibx_geoid_list <- ibx_tracts_sf$GEOID
 ## Create an IBX UNIVERSE data set
 # finding the Census Tract in NYC that is physically closest to a subway entrance
 # going to use this later to simulate a really close distance to subway for places where IBX is being built
-best_transit_z_score <- min(ml_data$dist_subway_miles)
+best_transit_z_score <- min(ml_data_scaled$dist_subway_miles)
 
-ibx_scenario_data <- ml_data %>%
+ibx_scenario_data_scaled <- ml_data_scaled %>%
   mutate(
-    # Inject best_transit_z_score into the IBX tracts
+     # Inject best_transit_z_score into the IBX tracts
     dist_subway_miles = ifelse(GEOID %in% ibx_geoid_list, best_transit_z_score, dist_subway_miles)
   )
 
-# Predict and flag new IBX station locations 
-final_map_data <- ml_data %>%
+# Predicted data is from the model which consumed scaled data
+# But we're using raw data so the display of neighborhood features is correct
+final_map_data <- ml_data_raw %>%
   mutate(
-    predicted_commute_baseline = predict(lm_fit_standardized, newdata = ml_data),
-    predicted_commute_ibx      = predict(lm_fit_standardized, newdata = ibx_scenario_data), 
+    predicted_commute_baseline = predict(lm_fit_standardized, newdata = ml_data_scaled),
+    predicted_commute_ibx      = predict(lm_fit_standardized, newdata = ibx_scenario_data_scaled),
     ibx_commute_relief         = predicted_commute_baseline - predicted_commute_ibx,
     is_ibx_location            = ifelse(GEOID %in% ibx_geoid_list, 1, 0)
   )
 
-saveRDS(final_map_data, file.path(projPath, "data", "model_input.rds"))
+saveRDS(final_map_data, file.path(projPath, "data", "model_input.rds")) 
 ```
 
 ```{r model-outputs} 
