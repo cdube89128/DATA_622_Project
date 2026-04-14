@@ -131,10 +131,12 @@ server <- function(input, output, session) {
     # Color Logic
     if (selected_var == "is_ibx_location") {
       pal <- colorFactor(c("#e0e0e0", "#d73027"), domain = c(0, 1))
-    } else if (selected_var %in% c("predicted_commute_baseline_rf", "predicted_commute_ibx_rf", "ibx_commute_relief_rf")) {
+    } else if (selected_var %in% c("predicted_commute_baseline_rf", "predicted_commute_ibx_rf")) {
+      pal <- colorNumeric("Blues", domain = var_data, na.color = "transparent")
+    } else if (selected_var == "ibx_commute_relief_rf") {
       pal <- colorNumeric("viridis", domain = var_data, reverse = TRUE, na.color = "transparent")
     } else if (selected_var == "rf_residual") {
-      pal <- colorNumeric("RdBu", domain = var_data, reverse = TRUE, na.color = "transparent")
+      pal <- colorNumeric("RdBu", domain = var_data, na.color = "transparent")
     } else if (selected_var == "ibx_commute_relief") {
       pal <- colorNumeric("YlGn", domain = var_data, na.color = "transparent")
     } else if (selected_var == "dist_subway_miles") {
