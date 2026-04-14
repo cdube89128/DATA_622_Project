@@ -12,6 +12,8 @@
 2. Open and run `app.R` to launch the Shiny app
 
 > **Note:** The `randomForest` package must be installed before knitting. Run `install.packages("randomForest")` in your R console once if you haven't already.
+> 
+> **Note:** `nyc_census_tracts.rds` was updated with a new car ownership feature (`pct_2plus_cars`). Re-knit from the `vehicle-availability` chunk onward to pick up this change. You will need a Census API key for that chunk.
 
 ---
 
