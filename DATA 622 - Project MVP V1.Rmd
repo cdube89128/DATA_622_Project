@@ -813,24 +813,26 @@ test_data  <- ml_data_scaled[-train_idx, ]
 lm_fit_eval <- lm(pct_commute_60p ~ . - GEOID, data = train_data)
 
 ## Train RF on train set (for evaluation)
+# Drop GEOID from data explicitly — randomForest treats character columns as
+# factors and fails on new levels at predict time if GEOID is left in
 rf_fit_eval <- randomForest(
-  pct_commute_60p ~ . - GEOID,
-  data       = train_data,
+  pct_commute_60p ~ .,
+  data       = train_data %>% select(-GEOID),
   ntree      = 500,
   importance = TRUE
 )
 
 ## Train RF on full dataset (used for map predictions)
 rf_fit <- randomForest(
-  pct_commute_60p ~ . - GEOID,
-  data       = ml_data_scaled,
+  pct_commute_60p ~ .,
+  data       = ml_data_scaled %>% select(-GEOID),
   ntree      = 500,
   importance = TRUE
 )
 
 ## EVALUATION on test set
 lm_preds <- predict(lm_fit_eval, newdata = test_data)
-rf_preds <- predict(rf_fit_eval, newdata = test_data)
+rf_preds <- predict(rf_fit_eval, newdata = test_data %>% select(-GEOID))
 actuals  <- test_data$pct_commute_60p
 
 rmse <- function(a, p) sqrt(mean((a - p)^2))
@@ -930,8 +932,8 @@ saveRDS(final_map_data, file.path(projPath, "data", "model_input.rds"))
 # final_map_data is still in memory — adding columns and re-saving.
 final_map_data_rf <- final_map_data %>%
   mutate(
-    predicted_commute_baseline_rf = predict(rf_fit, newdata = ml_data_scaled),
-    predicted_commute_ibx_rf      = predict(rf_fit, newdata = ibx_scenario_data_scaled),
+    predicted_commute_baseline_rf = predict(rf_fit, newdata = ml_data_scaled %>% select(-GEOID)),
+    predicted_commute_ibx_rf      = predict(rf_fit, newdata = ibx_scenario_data_scaled %>% select(-GEOID)),
     ibx_commute_relief_rf         = predicted_commute_baseline_rf - predicted_commute_ibx_rf,
     # Residual: positive = model underestimated commute burden (worse than expected)
     #           negative = model overestimated (better than expected)
