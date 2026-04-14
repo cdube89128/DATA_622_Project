@@ -717,6 +717,30 @@ print(top_uber)
 
 This is currently a simple linear model for proof of concept. We'll be able to build up something much more robust .
 
+### Borough Fixed Effects
+
+Our professor flagged that NYC neighborhoods are very different from each other — a feature value in the Bronx means something different than the same value in Manhattan. Adding borough as a factor variable lets both models learn a borough-level intercept, capturing unobserved variation that our census features don't fully explain.
+
+Borough is derived from the first 5 digits of GEOID (standard Census FIPS codes) so no additional data pull is needed.
+
+```{r borough-feature}
+# FIPS county codes for NYC boroughs
+borough_lookup <- c(
+  "36005" = "Bronx",
+  "36047" = "Brooklyn",
+  "36061" = "Manhattan",
+  "36081" = "Queens",
+  "36085" = "Staten Island"
+)
+
+# Derive borough from first 5 chars of GEOID and join onto the master table
+master_table <- readRDS(file.path(projPath, "data", "model_input.rds")) %>%
+  mutate(borough = factor(borough_lookup[substr(GEOID, 1, 5)]))
+
+saveRDS(master_table, file.path(projPath, "data", "model_input.rds"))
+print(table(master_table$borough))
+```
+
 ### Model 1
 
 `ml_data` is selecting the features to go into the model. A very very simple model is happening here. We need to implement train-test and better model selection still.
@@ -731,16 +755,19 @@ id_vars <- c("GEOID")
 target_var <- c("pct_commute_60p")
 
 predictor_vars <- c(
+  # Borough Fixed Effect
+  "borough",
+
   # Infrastructure & Mobility
-  "stations_per_sq_mile", "stations_per_1000_pop", "dist_subway_miles", 
+  "stations_per_sq_mile", "stations_per_1000_pop", "dist_subway_miles",
   "uber_trips_per_capita", "bike_trips_per_capita",
-  
+
   # Economic & Housing
-  "med_income", "pct_poverty", "pct_vacant", "pct_renter", 
-  
+  "med_income", "pct_poverty", "pct_vacant", "pct_renter",
+
   # Demographics & Commute Behaviors
   "pop_density", "pct_no_car", "pct_transit", "pct_bachelors", "pct_wfh", "pct_walk",
-  
+
   # Age Buckets
   "pct_age_18_24", "pct_age_25_34", "pct_age_35_44", "pct_age_45_64", "pct_age_65_plus"
 )
@@ -752,10 +779,13 @@ ml_data_raw <- readRDS(file.path(projPath, "data", "model_input.rds")) %>%
   drop_na()
 
 ## SCALE THE DATA FOR THE MODEL
+# Scale numeric predictors only — borough is a factor and must not be z-scored
+numeric_predictors <- predictor_vars[predictor_vars != "borough"]
+
 ml_data_scaled <- ml_data_raw %>%
   mutate(across(
-    .cols = all_of(predictor_vars), # ONLY scale the predictors!
-    .fns = ~ as.numeric(scale(.))
+    .cols = all_of(numeric_predictors),
+    .fns  = ~ as.numeric(scale(.))
   ))
 
 ## TRAIN THE MODEL
@@ -896,17 +926,20 @@ saveRDS(final_map_data, file.path(projPath, "data", "model_input.rds"))
 ```
 
 ```{r ibx-rf-predictions}
-# Append RF IBX predictions to the map data already saved by the chunk above.
-# final_map_data is still in memory — adding RF columns and re-saving.
+# Append RF IBX predictions and residuals to the map data already saved by the chunk above.
+# final_map_data is still in memory — adding columns and re-saving.
 final_map_data_rf <- final_map_data %>%
   mutate(
     predicted_commute_baseline_rf = predict(rf_fit, newdata = ml_data_scaled),
     predicted_commute_ibx_rf      = predict(rf_fit, newdata = ibx_scenario_data_scaled),
-    ibx_commute_relief_rf         = predicted_commute_baseline_rf - predicted_commute_ibx_rf
+    ibx_commute_relief_rf         = predicted_commute_baseline_rf - predicted_commute_ibx_rf,
+    # Residual: positive = model underestimated commute burden (worse than expected)
+    #           negative = model overestimated (better than expected)
+    rf_residual                   = pct_commute_60p - predicted_commute_baseline_rf
   )
 
 saveRDS(final_map_data_rf, file.path(projPath, "data", "model_input.rds"))
-print("RF predictions appended to model_input.rds")
+print("RF predictions and residuals appended to model_input.rds")
 ```
 
 ```{r model-outputs}

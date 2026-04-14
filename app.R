@@ -36,7 +36,8 @@ ui <- fluidPage(
                     "🌲 IBX Predictive Simulation (Random Forest)" = c(
                       "RF: Predicted 60m+ Commutes (Current)"  = "predicted_commute_baseline_rf",
                       "RF: Predicted 60m+ Commutes (With IBX)" = "predicted_commute_ibx_rf",
-                      "RF: IBX Commute Relief (% Time Saved)"  = "ibx_commute_relief_rf"
+                      "RF: IBX Commute Relief (% Time Saved)"  = "ibx_commute_relief_rf",
+                      "RF: Residuals (Actual minus Predicted)"  = "rf_residual"
                     ),
                     "⏱️ Existing Commute Burden" = c(
                       "Actual % of 60m+ Commutes"     = "pct_commute_60p",
@@ -87,6 +88,7 @@ server <- function(input, output, session) {
     "predicted_commute_baseline_rf" = "Predicted 60m+ Commute Rate (RF)",
     "predicted_commute_ibx_rf"      = "Simulated 60m+ Commute (Post-IBX, RF)",
     "ibx_commute_relief_rf"         = "Net Commute Relief (RF)",
+    "rf_residual"                   = "RF Residuals (Actual − Predicted)",
     "pct_commute_60p"            = "Actual 60m+ Commute Rate",
     "is_ibx_location"            = "IBX Station Area (0.5mi)",
     "dist_subway_miles"          = "Distance to Subway (Miles)",
@@ -129,6 +131,8 @@ server <- function(input, output, session) {
     # Color Logic
     if (selected_var == "is_ibx_location") {
       pal <- colorFactor(c("#e0e0e0", "#d73027"), domain = c(0, 1))
+    } else if (selected_var == "rf_residual") {
+      pal <- colorNumeric("RdBu", domain = var_data, reverse = TRUE, na.color = "transparent")
     } else if (selected_var == "ibx_commute_relief") {
       pal <- colorNumeric("YlGn", domain = var_data, na.color = "transparent")
     } else if (selected_var == "dist_subway_miles") {

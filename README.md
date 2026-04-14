@@ -6,6 +6,15 @@
  
 ---
 
+## How to Run
+
+1. Knit `DATA 622 - Project MVP V1.Rmd` top to bottom — this regenerates `data/model_input.rds`
+2. Open and run `app.R` to launch the Shiny app
+
+> **Note:** The `randomForest` package must be installed before knitting. Run `install.packages("randomForest")` in your R console once if you haven't already.
+
+---
+
 ## SETUP INSTRUCTIONS 
 Before running any code in this repository,
 
