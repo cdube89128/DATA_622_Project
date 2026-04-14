@@ -932,9 +932,9 @@ saveRDS(final_map_data, file.path(projPath, "data", "model_input.rds"))
 # final_map_data is still in memory — adding columns and re-saving.
 final_map_data_rf <- final_map_data %>%
   mutate(
-    predicted_commute_baseline_rf = predict(rf_fit, newdata = ml_data_scaled %>% select(-GEOID)),
-    predicted_commute_ibx_rf      = predict(rf_fit, newdata = ibx_scenario_data_scaled %>% select(-GEOID)),
-    ibx_commute_relief_rf         = predicted_commute_baseline_rf - predicted_commute_ibx_rf,
+    predicted_commute_baseline_rf = pmax(0, predict(rf_fit, newdata = ml_data_scaled %>% select(-GEOID))),
+    predicted_commute_ibx_rf      = pmax(0, predict(rf_fit, newdata = ibx_scenario_data_scaled %>% select(-GEOID))),
+    ibx_commute_relief_rf         = pmax(0, predicted_commute_baseline_rf - predicted_commute_ibx_rf),
     # Residual: positive = model underestimated commute burden (worse than expected)
     #           negative = model overestimated (better than expected)
     rf_residual                   = pct_commute_60p - predicted_commute_baseline_rf
