@@ -766,6 +766,55 @@ print("Model Summary: ")
 summary(lm_fit_standardized) 
 ```
 
+### Model 2: Random Forest + Evaluation
+
+Adding a Random Forest alongside the linear baseline. Both are evaluated on a held-out test set so the comparison is fair. The RF is also trained on the full dataset (`rf_fit`) for use in the IBX simulation and map predictions below.
+
+```{r random-forest-model}
+library(randomForest)
+
+## TRAIN/TEST SPLIT (80/20)
+set.seed(622)
+train_idx  <- sample(nrow(ml_data_scaled), size = 0.8 * nrow(ml_data_scaled))
+train_data <- ml_data_scaled[train_idx, ]
+test_data  <- ml_data_scaled[-train_idx, ]
+
+## Retrain linear on train set only (for a fair apples-to-apples comparison)
+lm_fit_eval <- lm(pct_commute_60p ~ . - GEOID, data = train_data)
+
+## Train RF on train set (for evaluation)
+rf_fit_eval <- randomForest(
+  pct_commute_60p ~ . - GEOID,
+  data       = train_data,
+  ntree      = 500,
+  importance = TRUE
+)
+
+## Train RF on full dataset (used for map predictions)
+rf_fit <- randomForest(
+  pct_commute_60p ~ . - GEOID,
+  data       = ml_data_scaled,
+  ntree      = 500,
+  importance = TRUE
+)
+
+## EVALUATION on test set
+lm_preds <- predict(lm_fit_eval, newdata = test_data)
+rf_preds <- predict(rf_fit_eval, newdata = test_data)
+actuals  <- test_data$pct_commute_60p
+
+rmse <- function(a, p) sqrt(mean((a - p)^2))
+r2   <- function(a, p) 1 - sum((a - p)^2) / sum((a - mean(a))^2)
+
+eval_table <- tibble(
+  Model = c("Linear Regression", "Random Forest"),
+  RMSE  = round(c(rmse(actuals, lm_preds), rmse(actuals, rf_preds)), 3),
+  R2    = round(c(r2(actuals,   lm_preds), r2(actuals,   rf_preds)), 3)
+)
+
+kable(eval_table, caption = "Model Comparison — 80/20 Test Set")
+```
+
 ### IBX Simulation
 
 Here, the approximate locations of the new IBX stations are being brought in. And then in the census areas where they go, we're basically dropping the distance to train for those areas to really low. There may be a more robust way of implementing the "simulation" of the IBX station than this, but this seemed like a good starting point.
@@ -846,7 +895,21 @@ final_map_data <- ml_data_raw %>%
 saveRDS(final_map_data, file.path(projPath, "data", "model_input.rds")) 
 ```
 
-```{r model-outputs} 
+```{r ibx-rf-predictions}
+# Append RF IBX predictions to the map data already saved by the chunk above.
+# final_map_data is still in memory — adding RF columns and re-saving.
+final_map_data_rf <- final_map_data %>%
+  mutate(
+    predicted_commute_baseline_rf = predict(rf_fit, newdata = ml_data_scaled),
+    predicted_commute_ibx_rf      = predict(rf_fit, newdata = ibx_scenario_data_scaled),
+    ibx_commute_relief_rf         = predicted_commute_baseline_rf - predicted_commute_ibx_rf
+  )
+
+saveRDS(final_map_data_rf, file.path(projPath, "data", "model_input.rds"))
+print("RF predictions appended to model_input.rds")
+```
+
+```{r model-outputs}
 
 # Model Results
 lm_results <- tidy(lm_fit_standardized) %>%
@@ -862,6 +925,25 @@ ggplot(lm_results, aes(x = estimate, y = reorder(term, estimate))) +
        subtitle = "Standardized Coefficients (Variables further from 0 have a stronger impact)",
        x = "Effect on 60+ Minute Commute Rate (per 1 Std. Dev. increase)",
        y = "Feature")
+```
+
+```{r rf-feature-importance}
+# Variable importance from the full RF model
+rf_importance <- importance(rf_fit) %>%
+  as.data.frame() %>%
+  rownames_to_column("Feature") %>%
+  arrange(desc(`%IncMSE`))
+
+ggplot(rf_importance, aes(x = `%IncMSE`, y = reorder(Feature, `%IncMSE`))) +
+  geom_point(size = 3, color = "darkgreen") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  theme_minimal() +
+  labs(
+    title    = "Random Forest: Feature Importance",
+    subtitle = "% increase in MSE when feature is permuted — higher = more important",
+    x        = "% Increase in MSE (Permutation Importance)",
+    y        = "Feature"
+  )
 ```
 
 ## Misc. Notes Dump
