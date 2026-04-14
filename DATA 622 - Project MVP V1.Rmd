@@ -373,6 +373,50 @@ print(paste("Census features and geometry saved to:", census_save_path))
 head(nyc_tracts_clean)
 ```
 
+### Vehicle Availability (Cars Owned)
+
+Adding car ownership as a feature — flagged by our professor as likely the strongest missing predictor and a key source of omitted-variable bias. Pulling just this table separately to avoid re-running the full cached census pull.
+
+`pct_2plus_cars` captures car-dependent households (2+ vehicles) which is more informative than the binary `pct_no_car` already in the model.
+
+```{r vehicle-availability}
+# Pull B25044: Tenure by Vehicles Available (2022 ACS 5-Year)
+vehicle_vars <- c(
+  tot_occup_veh  = "B25044_001", # Total occupied housing units
+  own_2car       = "B25044_005", # Owner occupied, 2 vehicles
+  own_3car       = "B25044_006", # Owner occupied, 3 vehicles
+  own_4plus_car  = "B25044_007", # Owner occupied, 4+ vehicles
+  rent_2car      = "B25044_011", # Renter occupied, 2 vehicles
+  rent_3car      = "B25044_012", # Renter occupied, 3 vehicles
+  rent_4plus_car = "B25044_013"  # Renter occupied, 4+ vehicles
+)
+
+nyc_vehicle_raw <- get_acs(
+  geography = "tract",
+  variables = vehicle_vars,
+  state     = "NY",
+  county    = nyc_counties,
+  year      = 2022,
+  output    = "wide"
+)
+
+# Engineer pct_2plus_cars: % of occupied households with 2 or more vehicles
+nyc_vehicle <- nyc_vehicle_raw %>%
+  transmute(
+    GEOID,
+    pct_2plus_cars = ((own_2carE + own_3carE + own_4plus_carE +
+                       rent_2carE + rent_3carE + rent_4plus_carE) / tot_occup_vehE) * 100
+  )
+
+# Join onto existing census tracts and re-save
+nyc_tracts_clean <- readRDS(file.path(projPath, "data", "nyc_census_tracts.rds")) %>%
+  left_join(nyc_vehicle, by = "GEOID") %>%
+  mutate(pct_2plus_cars = replace_na(pct_2plus_cars, 0))
+
+saveRDS(nyc_tracts_clean, file.path(projPath, "data", "nyc_census_tracts.rds"))
+print("Vehicle availability feature added to nyc_census_tracts.rds")
+```
+
 ### Taxi Zones
 
 The taxi zone data is luckily pretty straightforward. It's just being imported here.
@@ -763,7 +807,7 @@ predictor_vars <- c(
   "uber_trips_per_capita", "bike_trips_per_capita",
 
   # Economic & Housing
-  "med_income", "pct_poverty", "pct_vacant", "pct_renter",
+  "med_income", "pct_poverty", "pct_vacant", "pct_renter", "pct_2plus_cars",
 
   # Demographics & Commute Behaviors
   "pop_density", "pct_no_car", "pct_transit", "pct_bachelors", "pct_wfh", "pct_walk",
