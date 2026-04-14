@@ -810,7 +810,7 @@ train_data <- ml_data_scaled[train_idx, ]
 test_data  <- ml_data_scaled[-train_idx, ]
 
 ## Retrain linear on train set only (for a fair apples-to-apples comparison)
-lm_fit_eval <- lm(pct_commute_60p ~ . - GEOID, data = train_data)
+lm_fit_eval <- lm(pct_commute_60p ~ ., data = train_data %>% select(-GEOID))
 
 ## Train RF on train set (for evaluation)
 # Drop GEOID from data explicitly — randomForest treats character columns as
@@ -831,7 +831,7 @@ rf_fit <- randomForest(
 )
 
 ## EVALUATION on test set
-lm_preds <- predict(lm_fit_eval, newdata = test_data)
+lm_preds <- predict(lm_fit_eval, newdata = test_data %>% select(-GEOID))
 rf_preds <- predict(rf_fit_eval, newdata = test_data %>% select(-GEOID))
 actuals  <- test_data$pct_commute_60p
 
