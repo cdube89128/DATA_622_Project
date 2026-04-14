@@ -763,7 +763,7 @@ This is currently a simple linear model for proof of concept. We'll be able to b
 
 ### Borough Fixed Effects
 
-Our professor flagged that NYC neighborhoods are very different from each other — a feature value in the Bronx means something different than the same value in Manhattan. Adding borough as a factor variable lets both models learn a borough-level intercept, capturing unobserved variation that our census features don't fully explain.
+Professor flagged that NYC neighborhoods are very different from each other — a feature value in the Bronx means something different than the same value in Manhattan. Adding borough as a factor variable lets both models learn a borough-level intercept, capturing unobserved variation that our census features don't fully explain.
 
 Borough is derived from the first 5 digits of GEOID (standard Census FIPS codes) so no additional data pull is needed.
 
@@ -854,29 +854,27 @@ train_data <- ml_data_scaled[train_idx, ]
 test_data  <- ml_data_scaled[-train_idx, ]
 
 ## Retrain linear on train set only (for a fair apples-to-apples comparison)
-lm_fit_eval <- lm(pct_commute_60p ~ ., data = train_data %>% select(-GEOID))
+lm_fit_eval <- lm(pct_commute_60p ~ . - GEOID, data = train_data)
 
 ## Train RF on train set (for evaluation)
-# Drop GEOID from data explicitly — randomForest treats character columns as
-# factors and fails on new levels at predict time if GEOID is left in
 rf_fit_eval <- randomForest(
-  pct_commute_60p ~ .,
-  data       = train_data %>% select(-GEOID),
+  pct_commute_60p ~ . - GEOID,
+  data       = train_data,
   ntree      = 500,
   importance = TRUE
 )
 
 ## Train RF on full dataset (used for map predictions)
 rf_fit <- randomForest(
-  pct_commute_60p ~ .,
-  data       = ml_data_scaled %>% select(-GEOID),
+  pct_commute_60p ~ . - GEOID,
+  data       = ml_data_scaled,
   ntree      = 500,
   importance = TRUE
 )
 
 ## EVALUATION on test set
-lm_preds <- predict(lm_fit_eval, newdata = test_data %>% select(-GEOID))
-rf_preds <- predict(rf_fit_eval, newdata = test_data %>% select(-GEOID))
+lm_preds <- predict(lm_fit_eval, newdata = test_data)
+rf_preds <- predict(rf_fit_eval, newdata = test_data)
 actuals  <- test_data$pct_commute_60p
 
 rmse <- function(a, p) sqrt(mean((a - p)^2))
@@ -972,20 +970,17 @@ saveRDS(final_map_data, file.path(projPath, "data", "model_input.rds"))
 ```
 
 ```{r ibx-rf-predictions}
-# Append RF IBX predictions and residuals to the map data already saved by the chunk above.
-# final_map_data is still in memory — adding columns and re-saving.
+# Append RF IBX predictions to the map data already saved by the chunk above.
+# final_map_data is still in memory — adding RF columns and re-saving.
 final_map_data_rf <- final_map_data %>%
   mutate(
-    predicted_commute_baseline_rf = pmax(0, predict(rf_fit, newdata = ml_data_scaled %>% select(-GEOID))),
-    predicted_commute_ibx_rf      = pmax(0, predict(rf_fit, newdata = ibx_scenario_data_scaled %>% select(-GEOID))),
-    ibx_commute_relief_rf         = pmax(0, predicted_commute_baseline_rf - predicted_commute_ibx_rf),
-    # Residual: positive = model underestimated commute burden (worse than expected)
-    #           negative = model overestimated (better than expected)
-    rf_residual                   = pct_commute_60p - predicted_commute_baseline_rf
+    predicted_commute_baseline_rf = predict(rf_fit, newdata = ml_data_scaled),
+    predicted_commute_ibx_rf      = predict(rf_fit, newdata = ibx_scenario_data_scaled),
+    ibx_commute_relief_rf         = predicted_commute_baseline_rf - predicted_commute_ibx_rf
   )
 
 saveRDS(final_map_data_rf, file.path(projPath, "data", "model_input.rds"))
-print("RF predictions and residuals appended to model_input.rds")
+print("RF predictions appended to model_input.rds")
 ```
 
 ```{r model-outputs}
