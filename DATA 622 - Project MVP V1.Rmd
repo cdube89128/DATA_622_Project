@@ -19,7 +19,7 @@ if(!require(pacman)) install.packages("pacman")
 pacman::p_load(
    tidyverse, 
    fpp3, 
-   rstudioapi,
+   #rstudioapi, #commented out because im in positron
    tidycensus,
    r5r, 
    sf, #spacial data handling
@@ -31,9 +31,12 @@ pacman::p_load(
    knitr,
    janitor, # clean up the names of columns that have spaces (subway entrances data)
    tidygeocoder,
-   broom
+   broom,
+   
 )
-projPath <- dirname(file.path(getSourceEditorContext()$path))
+
+#i just hard coded it becuase postiron was making it difficult
+projPath <- "C:\\Users\\guill\\Documents\\GitHub\\DATA_622_Project"
 
 ```
 
@@ -1020,6 +1023,357 @@ ggplot(rf_importance, aes(x = `%IncMSE`, y = reorder(Feature, `%IncMSE`))) +
   )
 ```
 
+
+### BART (Bayesian Additive Regression Trees)
+Predicts the effect of an intervention (e.g., a new medicine) by combining hundreds of small, simple decision trees to model complex, non-linear relationships, even without explicit programming. It excels at estimating, "What would have happened to this specific person if they had taken the treatment?". 
+
+```{r}
+#install.packages("bartCause")
+library(bartCause)
+```
+
+Treatment variable (0/1)
+```{r causal-forest-model}
+# add a binary 1/0 column noting which GEOID's where included in our IBX "treatment"
+ml_data_scaled$ibx_treatment <- as.integer(ml_data_scaled$GEOID %in% ibx_geoid_list)
+```
+
+thinkCausal website:
+```{r}
+# I was trying to use the thinkCausal website (https://apsta.shinyapps.io/thinkCausal/) to explore bartCause but it kept crashing when fitting our full model, but i was able to try using it with just a few variables at a time, some of the below sections were inspired from that
+#write.csv(ml_data_scaled, "ml_data_scaled.csv")
+```
+
+```{r}
+# Drop ID column
+BART_data <- ml_data_scaled[, !(names(ml_data_scaled) %in% "GEOID")]
+
+# Outcome
+y <- BART_data$pct_commute_60p
+
+# Treatment (must be numeric 0/1)
+z <- BART_data$ibx_treatment
+
+# Covariates (confounders only)
+x <- BART_data[, !(names(BART_data) %in% c("pct_commute_60p", "ibx_treatment"))]
+```
+
+Visualize the data:
+1. overlap graph? (for ATE, ATT, and ATC). Overlap is a property of the data (treatment vs covariates)
+```{r}
+ps_model <- glm(z ~ ., data = BART_df, family = binomial)
+ps <- predict(ps_model, type = "response")
+```
+
+Basic overlap plot (treated vs control)
+```{r}
+hist(ps[z == 1], col = rgb(1, 0, 0, 0.5),
+     xlim = c(0,1), main = "Propensity Score Overlap",
+     xlab = "Propensity Score")
+
+hist(ps[z == 0], col = rgb(0, 0, 1, 0.5), add = TRUE)
+
+legend("topright", legend = c("Treated", "Control"),
+       fill = c(rgb(1,0,0,0.5), rgb(0,0,1,0.5)))
+```
+
+Weighting for ATE, ATT, ATC
+```{r}
+w_ate <- ifelse(z == 1, 1/ps, 1/(1 - ps))
+w_att <- ifelse(z == 1, 1, ps/(1 - ps))
+w_atc <- ifelse(z == 1, (1 - ps)/ps, 1)
+```
+
+ATE plot: We want strong overlap across full range. Poor overlap implies ATE relies on extrapolation? 
+```{r}
+library(ggplot2)
+
+BART_df <- data.frame(ps = ps, z = z, y =y, z=z, x=x)
+BART_df <- na.omit(df)
+
+# ATE
+ggplot(BART_df, aes(x = ps, fill = factor(z))) +
+  geom_density(alpha = 0.4, aes(weight = w_ate)) +
+  labs(title = "Overlap (ATE)", fill = "Treatment")
+```
+
+ATT plot: Do control units resemble treated units?
+```{r}
+# ATT
+ggplot(BART_df, aes(x = ps, fill = factor(z))) +
+  geom_density(alpha = 0.4, aes(weight = w_att)) +
+  labs(title = "Overlap (ATT)", fill = "Treatment")
+```
+
+ATC plot: Do treated units resemble controls?
+```{r}
+# ATC
+ggplot(BART_df, aes(x = ps, fill = factor(z))) +
+  geom_density(alpha = 0.4, aes(weight = w_atc)) +
+  labs(title = "Overlap (ATC)", fill = "Treatment")
+```
+
+2. Balance graph, poitns represent the treatment group (for ATE, ATT, and ATC).
+Each point = a covariate. X-axis = standardized mean difference (SMD). Two sets of points: Before weighting and after weighting.
+|SMD| < 0.1 is generally considered “balanced”. Balance plots are still based on propensity-style weighting. They diagnose whether your causal identification assumption is plausible. If balance is poor, the BART ATE may still be biased, especially in regions with weak overlap. Should we be dropping any variables with weak overlap?
+
+```{r}
+#install.packages("cobalt")
+library(cobalt)
+```
+
+```{r}
+bal_ate <- bal.tab(x, treat = z, weights = w_ate, estimand = "ATE",un = TRUE,quick = FALSE)
+bal_att <- bal.tab(x, treat = z, weights = w_att, estimand = "ATT",un = TRUE,quick = FALSE)
+bal_atc <- bal.tab(x, treat = z, weights = w_atc, estimand = "ATC",un = TRUE,quick = FALSE)
+```
+
+Covariate Balance (ATE)
+```{r}
+love.plot(bal_ate, threshold = 0.1, abs = TRUE,
+          title = "Covariate Balance (ATE)",stars = "raw",stats = "mean.diffs")
+```
+
+Covariate Balance (ATT)
+```{r}
+love.plot(bal_att, threshold = 0.1, abs = TRUE,
+          title = "Covariate Balance (ATT)", stars = "raw")
+```
+
+Covariate Balance (ATC)
+```{r}
+love.plot(bal_atc, threshold = 0.1, abs = TRUE,
+          title = "Covariate Balance (ATC)",stars = "raw")
+```
+
+Fit our model:
+1. Causal Estimand: do we want ATE, ATT, and ATC? We're adding a new train line which is alittle different than just giving a new drug or something? I think we're most interested in ATT to measure how effective our treatment was for our area where we're adding it.
+
+ATE (Average Treatment Effect): Measures the average impact of a treatment if everyone in the population was treated versus if nobody was treated. It answers: "What is the overall effect of the intervention?".
+
+ATT (Average Treatment Effect on the Treated): Measures the average impact of a treatment only for those who actually received it. It answers: "Did the treatment work for those who got it?".
+
+ATC / ATU (Average Treatment Effect on the Control/Untreated): Measures the impact of treatment on the subgroup that did not receive it. It answers: "What would have happened if those who didn't get the treatment actually did?"
+
+ATE BART Fit
+```{r}
+bart_fit <- bartc(
+  response = BART_df$y,
+  treatment = BART_df$z,
+  confounders = BART_df[, !(names(BART_df) %in% c("y", "z"))],
+  estimand = "ate"
+)
+```
+
+```{r}
+summary(bart_fit)
+class(bart_fit)
+```
+
+Individual treatment effects
+```{r}
+ite <- fitted(bart_fit, type = "icate")
+```
+
+ATT "Assuming Ignorability and SUTVA are satisfied, for participants in our study that received the treatment/new train line, receiving the new train line/treatment led to a decrease of n units (percent decrease in 60 min commutes?) compared to what would have happened had these participants not received the treatment.":
+```{r}
+att <- mean(ite[z == 1], na.rm = TRUE)
+att
+```
+
+ATT Credible interval:
+```{r}
+att_ci <- quantile(ite[z == 1], c(0.025, 0.975), na.rm = TRUE)
+att_ci
+```
+
+Check:
+1. ATT Distribution (Treated Units)
+```{r}
+att <- mean(ite[z == 1], na.rm = TRUE)
+
+hist(ite[z == 1],
+     main = "ATT Distribution (Treated Units)",
+     xlab = "Individual Treatment Effects")
+abline(v = att, col = "red", lwd = 2)
+```
+
+Results:
+
+Subgroup analysis:
+1. treatment effect variation waterfall graph
+
+Treatment Effect Heterogeneity (Waterfall graph)
+```{r}
+ite_sorted <- as.numeric(ite)
+ite_sorted <- sort(ite_sorted)
+
+plot(ite_sorted, type = "l",
+     col = "black",
+     xlab = "Units (sorted)",
+     ylab = "Treatment Effect",
+     main = "Treatment Effect Heterogeneity (Waterfall graph)")
+abline(h = 0, col = "red", lwd = 2)
+```
+
+2. predictors of variation (tree depth graph)
+
+Individual Treatment Effect (ITE)
+```{r}
+ite <- as.numeric(fitted(bart_fit, type = "icate"))
+```
+
+```{r}
+var_model <- lm(ite ~ ., data = as.data.frame(x))
+summary(var_model)
+```
+
+I guess this is expected, we put our new treatment line in queens, then ofc the biggest predictor of reduced commute from our new line in queens... is that the district is in queens...  
+```{r}
+coef_df <- data.frame(
+  variable = names(coef(var_model))[-1],
+  effect = coef(var_model)[-1]
+)
+
+ggplot(coef_df, aes(x = reorder(variable, effect), y = effect)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "Predictors of Treatment Effect Variation",
+       x = "Covariates",
+       y = "Effect on ITE")
+```
+
+
+
+##### TREATED TRACTS ONLY: Among the treated units only, which covariates explain variation in their treatment effects?
+
+Individual Treatment Effect (ITE) for just treated, and X covariates just for treated:
+```{r}
+x_treated <- x[z == 1, ]
+ite_treated <- ite[z == 1]
+```
+
+```{r}
+var_model_treated <- lm(ite_treated ~ ., data = as.data.frame(x_treated))
+```
+
+```{r}
+coef_df <- data.frame(
+  variable = names(coef(var_model_treated))[-1],
+  effect = coef(var_model_treated)[-1]
+)
+```
+
+Still Queens is Queen. But Bike trips per capita is up there too now! More stations per 1000 pop predicting a higher expected commute after treatment is confusing to me? Same with no car percent?
+Positive coefficient increases treatment effect among treated.
+Negative coefficient decreases treatment effect among treated.
+```{r}
+ggplot(coef_df, aes(x = reorder(variable, effect), y = effect)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "Predictors of Treatment Effect Variation (Treated Only)",
+       x = "Covariates",
+       y = "Effect on ITE")
+```
+
+3. Exploratory subgroup analysis (histograms): explore treatment effect heterogeneity across subgroups
+
+Why are there MORE expected 60+ min commutes in brooklyn post treatment??? More stations should just reduce expected commute times, i dont understand, that number should fall. I think we' must've messed something up using our tracts geographic center for predicting commute times? 
+```{r}
+ggplot(x_treated, aes(x = ite_treated)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  facet_wrap(~ borough) +
+  labs(title = "Treatment Effect Distribution by Borough (Treated Only)",
+       x = "Treatment Effect",
+       y = "Count") +
+  theme_minimal()
+```
+
+```{r}
+ggplot(x_treated, aes(x = ite_treated, color = borough)) +
+  geom_density(size = 1) +
+  labs(title = "Treatment Effect Density by Borough",
+       x = "ITE",
+       y = "Density") +
+  theme_minimal()
+```
+
+Tree-based subgroup discovery for just treatment group only: Which splits in covariates create groups with different treatment effects?
+```{r}
+library("rpart.plot")
+library(rpart)
+
+tree_model <- rpart(ite_treated ~ ., data = x_treated, method = "anova", control = rpart.control(cp = 0.001, minbucket = 10))
+
+rpart.plot(tree_model, main = "Subgroups Driving Treatment Effect Heterogeneity")
+```
+
+#### SPATIAL LAGS: include averages of neighboring tract values to account for spatial autocorrelation
+
+For each tract (GEOID), you want variables like:
+average outcome in neighboring tracts
+average treatment in neighboring tracts
+average covariates in neighboring tracts
+
+Define spatial neighbors
+```{r}
+#install.packages("spdep")
+library(sf)
+library(spdep)
+
+#tracts_sf <- st_as_sf( WHAT DF SHOULD THIS BE?)
+neighbors <- poly2nb(tracts_sf)
+weights <- nb2listw(neighbors, style = "W", zero.policy = TRUE)
+```
+
+Create spatial lag variables
+```{r}
+spatial_lag_df <- BART_df
+```
+
+Outcome lag (neighbor avg commute time)
+```{r}
+spatial_lag_df$lag_commute <- lag.listw(weights, BART_df$y)
+```
+
+Treatment lag (neighbor treatment exposure)
+```{r}
+spatial_lag_df$lag_treatment <- lag.listw(weights, BART_df$z)
+```
+
+EXAMPLES of others we can add:
+```{r}
+spatial_lag_df$lag_income <- lag.listw(weights, BART_df$med_income)
+#ml_data_scaled$lag_distance_from_ny <- lag.listw(weights, BART_df$ WE SHOULD ADD A DISTANCE FROM MANHATTAN VARIABLE)
+```
+
+Need to edit and add this when done to add it to our map:
+```{r ibx-BART-predictions}
+# Append BART IBX predictions to the map data already saved by the chunk above.
+# final_map_data is still in memory — adding RF columns and re-saving.
+
+#final_map_data_BART <- final_map_data_rf %>%
+#  mutate(
+#    predicted_commute_baseline_BART = predict(rf_fit, newdata = ml_data_scaled),
+#    predicted_commute_ibx_BART    = predict(rf_fit, newdata = ibx_scenario_data_scaled),
+#    ibx_commute_relief_BART         = predicted_commute_baseline_rf - predicted_commute_ibx_rf
+#  )
+
+#saveRDS(final_map_data_rf, file.path(projPath, "data", "model_input.rds"))
+#print("RF predictions appended to model_input.rds")
+```
+
 ## Misc. Notes Dump
  
-nothing right now.
+Spatial lag features — include averages of neighboring tract values to account for spatial autocorrelation; used in similar transit research and directly relevant to the IBX corridor analysis
+
+K-fold cross-validation — more robust evaluation than a single 80/20 split given our dataset size
+
+George: it might be good to have a "proximity to Manhattan" feature, otherwise the coefficients that are going to be learned for other coefficients will partially be capturing the geographic structure.
+
+George: Second, you may want think about whether linear relationships are appropriate for all variables, particularly those which have outlier values (for example the citibike share or uber/taxi share). I also suspect the distance from subway relationship is nonlinear, like the difference from 20 minutes and 25 minutes walk to the subway might not matter. This is important because if you use a linear model, the relationship at short walk times will be constrained by the data for long walk times.
+
+George: Try the the bartCause R package. It has built in a lot of model checks that determine how much you can truly say about causal effects given the data. read about it more here: https://apsta.shinyapps.io/thinkCausal/. IMO it is better than the CausalForest stuff from the EconML package, but that is my subjective opinion.
+
+George: In the predicted 60m commute time, note the presence of negative values. I highly recommend applying a transformation to take the interval from 0-1 to the entire number line, i.e. a log transformation or a sigmoid function of some type. This would prevent the negative number issue.
+
