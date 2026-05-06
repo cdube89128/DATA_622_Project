@@ -1047,21 +1047,30 @@ thinkCausal website:
 ```{r}
 # Drop ID column
 BART_data <- ml_data_scaled[, !(names(ml_data_scaled) %in% "GEOID")]
+BART_data <- na.omit(BART_data)
 
 # Outcome
 y <- BART_data$pct_commute_60p
 
 # Treatment (must be numeric 0/1)
-z <- BART_data$ibx_treatment
+z <- as.numeric(BART_data$ibx_treatment)
 
 # Covariates (confounders only)
 x <- BART_data[, !(names(BART_data) %in% c("pct_commute_60p", "ibx_treatment"))]
+x <- as.matrix(x)
+
+
 ```
 
 Visualize the data:
 1. overlap graph? (for ATE, ATT, and ATC). Overlap is a property of the data (treatment vs covariates)
 ```{r}
-ps_model <- glm(z ~ ., data = BART_df, family = binomial)
+ps_model <- glm(
+  ibx_treatment ~ . - pct_commute_60p,
+  data = BART_data,
+  family = binomial
+)
+
 ps <- predict(ps_model, type = "response")
 ```
 
@@ -1088,8 +1097,8 @@ ATE plot: We want strong overlap across full range. Poor overlap implies ATE rel
 ```{r}
 library(ggplot2)
 
-BART_df <- data.frame(ps = ps, z = z, y =y, z=z, x=x)
-BART_df <- na.omit(df)
+BART_df <- data.frame(ps = ps, z = z, y = y, x=x)
+BART_df <- na.omit(BART_df)
 
 # ATE
 ggplot(BART_df, aes(x = ps, fill = factor(z))) +
@@ -1123,9 +1132,9 @@ library(cobalt)
 ```
 
 ```{r}
-bal_ate <- bal.tab(x, treat = z, weights = w_ate, estimand = "ATE",un = TRUE,quick = FALSE)
-bal_att <- bal.tab(x, treat = z, weights = w_att, estimand = "ATT",un = TRUE,quick = FALSE)
-bal_atc <- bal.tab(x, treat = z, weights = w_atc, estimand = "ATC",un = TRUE,quick = FALSE)
+bal_ate <- bal.tab(x, treat = z, weights = w_ate, estimand = "ATE",un = TRUE,quick = true)
+bal_att <- bal.tab(x, treat = z, weights = w_att, estimand = "ATT",un = TRUE,quick = true)
+bal_atc <- bal.tab(x, treat = z, weights = w_atc, estimand = "ATC",un = TRUE,quick = true)
 ```
 
 Covariate Balance (ATE)
