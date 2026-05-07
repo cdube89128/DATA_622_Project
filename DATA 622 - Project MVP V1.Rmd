@@ -32,12 +32,12 @@ pacman::p_load(
    janitor, # clean up the names of columns that have spaces (subway entrances data)
    tidygeocoder,
    broom,
-   
+   cobalt
 )
 
 #i just hard coded it becuase postiron was making it difficult
-projPath <- "C:\\Users\\guill\\Documents\\GitHub\\DATA_622_Project"
-
+#projPath <- "C:\\Users\\guill\\Documents\\GitHub\\DATA_622_Project"
+projPath <- dirname(file.path(getSourceEditorContext()$path))
 ```
 
 
@@ -852,16 +852,23 @@ library(randomForest)
 
 ## TRAIN/TEST SPLIT (80/20)
 set.seed(622)
-train_idx  <- sample(nrow(ml_data_scaled), size = 0.8 * nrow(ml_data_scaled))
-train_data <- ml_data_scaled[train_idx, ]
-test_data  <- ml_data_scaled[-train_idx, ]
+
+# Drop GEOID before splitting. It's a per-row unique ID, not a predictor —
+# every tract is its own factor level, so any holdout will contain levels
+# unseen in train and predict() will error with "factor GEOID has new levels".
+# `- GEOID` in the formula isn't enough; R retains it in the model frame.
+model_data <- ml_data_scaled[, c(target_var, predictor_vars)]
+
+train_idx  <- sample(nrow(model_data), size = 0.8 * nrow(model_data))
+train_data <- model_data[train_idx, ]
+test_data  <- model_data[-train_idx, ]
 
 ## Retrain linear on train set only (for a fair apples-to-apples comparison)
-lm_fit_eval <- lm(pct_commute_60p ~ . - GEOID, data = train_data)
+lm_fit_eval <- lm(pct_commute_60p ~ ., data = train_data)
 
 ## Train RF on train set (for evaluation)
 rf_fit_eval <- randomForest(
-  pct_commute_60p ~ . - GEOID,
+  pct_commute_60p ~ .,
   data       = train_data,
   ntree      = 500,
   importance = TRUE
@@ -869,8 +876,8 @@ rf_fit_eval <- randomForest(
 
 ## Train RF on full dataset (used for map predictions)
 rf_fit <- randomForest(
-  pct_commute_60p ~ . - GEOID,
-  data       = ml_data_scaled,
+  pct_commute_60p ~ .,
+  data       = model_data,
   ntree      = 500,
   importance = TRUE
 )
@@ -1056,8 +1063,9 @@ y <- BART_data$pct_commute_60p
 z <- as.numeric(BART_data$ibx_treatment)
 
 # Covariates (confounders only)
+# Keep x as a data.frame — borough is a factor, and as.matrix() would coerce
+# the whole frame to character, which lands a NaN in bartc's sigma estimate.
 x <- BART_data[, !(names(BART_data) %in% c("pct_commute_60p", "ibx_treatment"))]
-x <- as.matrix(x)
 
 
 ```
@@ -1127,14 +1135,15 @@ Each point = a covariate. X-axis = standardized mean difference (SMD). Two sets 
 |SMD| < 0.1 is generally considered “balanced”. Balance plots are still based on propensity-style weighting. They diagnose whether your causal identification assumption is plausible. If balance is poor, the BART ATE may still be biased, especially in regions with weak overlap. Should we be dropping any variables with weak overlap?
 
 ```{r}
+# loaded via pacman instead
 #install.packages("cobalt")
-library(cobalt)
+#library(cobalt)
 ```
 
 ```{r}
-bal_ate <- bal.tab(x, treat = z, weights = w_ate, estimand = "ATE",un = TRUE,quick = true)
-bal_att <- bal.tab(x, treat = z, weights = w_att, estimand = "ATT",un = TRUE,quick = true)
-bal_atc <- bal.tab(x, treat = z, weights = w_atc, estimand = "ATC",un = TRUE,quick = true)
+bal_ate <- bal.tab(x, treat = z, weights = w_ate, estimand = "ATE",un = TRUE,quick = TRUE)
+bal_att <- bal.tab(x, treat = z, weights = w_att, estimand = "ATT",un = TRUE,quick = TRUE)
+bal_atc <- bal.tab(x, treat = z, weights = w_atc, estimand = "ATC",un = TRUE,quick = TRUE)
 ```
 
 Covariate Balance (ATE)
@@ -1330,9 +1339,16 @@ Define spatial neighbors
 library(sf)
 library(spdep)
 
-#tracts_sf <- st_as_sf( WHAT DF SHOULD THIS BE?)
+# Build tracts_sf aligned to BART_df row order.
+# BART_df rows come from ml_data_scaled (minus GEOID, na.omit was a no-op since
+# ml_data_raw was already drop_na'd) — so ml_data_scaled$GEOID gives the row
+# sequence. lag.listw is positional, not keyed by GEOID, so the arrange() is critical.
+tracts_sf <- nyc_tracts_clean %>%
+  filter(GEOID %in% ml_data_scaled$GEOID) %>%
+  arrange(match(GEOID, ml_data_scaled$GEOID))
+
 neighbors <- poly2nb(tracts_sf)
-weights <- nb2listw(neighbors, style = "W", zero.policy = TRUE)
+weights   <- nb2listw(neighbors, style = "W", zero.policy = TRUE)
 ```
 
 Create spatial lag variables
@@ -1352,7 +1368,7 @@ spatial_lag_df$lag_treatment <- lag.listw(weights, BART_df$z)
 
 EXAMPLES of others we can add:
 ```{r}
-spatial_lag_df$lag_income <- lag.listw(weights, BART_df$med_income)
+spatial_lag_df$lag_income <- lag.listw(weights, BART_df$x.med_income)
 #ml_data_scaled$lag_distance_from_ny <- lag.listw(weights, BART_df$ WE SHOULD ADD A DISTANCE FROM MANHATTAN VARIABLE)
 ```
 
