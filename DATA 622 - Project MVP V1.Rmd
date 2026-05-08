@@ -33,7 +33,9 @@ pacman::p_load(
    tidygeocoder,
    broom,
    cobalt,
-   here     # project-root-aware paths (works interactive AND during knit)
+   here,    # project-root-aware paths (works interactive AND during knit)
+   rsample,  # k-fold CV
+   rlang
 )
 
 # Resolve projPath: source-editor path when interactive, here() during knit.
@@ -794,9 +796,16 @@ saveRDS(master_table, file.path(projPath, "data", "model_input.rds"))
 print(table(master_table$borough))
 ```
 
-### Model 1
+### Model 1: Linear Regression (with and without spline)
 
-`ml_data` is selecting the features to go into the model. A very very simple model is happening here. We need to implement train-test and better model selection still.
+Two linear baselines:
+
+- `lm_fit_standardized` — pure linear regression
+- `lm_fit_spline` — same model + a natural cubic spline on `dist_subway_miles`
+
+Both fit on a **logit-transformed outcome** so predictions stay in [0, 100] (without it, plain `lm` will happily predict -3% or 105% when IBX pushes one feature to an extreme).
+
+The spline version handles the saturating distance effect George flagged — closer matters a lot, far doesn't (ISLP §7.4 prescribes natural cubic splines for this case). Linear baseline kept alongside so the Shiny app can show both.
 
 ```{r machine-learning-poc}
 # The selection for the Machine Learning model
@@ -865,43 +874,46 @@ print("Model Summary: ")
 summary(lm_fit_standardized)
 ```
 
-### Model 2: Random Forest + Evaluation
+### Model 2: Random Forest + 10-fold Cross-Validation
 
-Adding a Random Forest alongside the linear baseline. Both are evaluated on a held-out test set so the comparison is fair. The RF is also trained on the full dataset (`rf_fit`) for use in the IBX simulation and map predictions below.
+We compare three models — pure linear, linear+spline, and Random Forest — using 10-fold CV stratified by borough. Same folds for every model so the RMSE/R² comparisons are paired (ISLP Ch. 5 / Meetup 6). The **one-SE rule** then picks among them.
+
+A single 80/20 split — what we had before — is the high-variance case ISLP §5.1.1 explicitly warns against. CV averages out the fold-level noise.
+
+`rf_fit` is fit on the full dataset (no holdout) for the IBX simulation downstream — separate from the CV loop.
 
 ```{r random-forest-model}
 library(randomForest)
 
-## TRAIN/TEST SPLIT (80/20)
+## CV SETUP
+# 10-fold CV stratified by borough — same folds for every model so RMSE/R^2
+# comparisons are paired (per ISLP Ch. 5 / Meetup 6).
 set.seed(622)
-
-# Drop GEOID before splitting. It's a per-row unique ID, not a predictor —
-# every tract is its own factor level, so any holdout will contain levels
-# unseen in train and predict() will error with "factor GEOID has new levels".
-# `- GEOID` in the formula isn't enough; R retains it in the model frame.
 model_data <- ml_data_scaled[, c(target_var, predictor_vars)]
+folds <- rsample::vfold_cv(model_data, v = 10, strata = borough)
 
-train_idx  <- sample(nrow(model_data), size = 0.8 * nrow(model_data))
-train_data <- model_data[train_idx, ]
-test_data  <- model_data[-train_idx, ]
+# Fit one model on the analysis side of a fold, predict on the assessment side.
+run_cv <- function(folds, fit_fn) {
+  imap_dfr(folds$splits, function(split, fold_id) {
+    train <- rsample::analysis(split)
+    test  <- rsample::assessment(split)
+    fit   <- fit_fn(train)
+    tibble(
+      fold   = as.integer(fold_id),
+      actual = test$pct_commute_60p,
+      pred   = as.numeric(predict(fit, newdata = test))
+    )
+  })
+}
 
-## Retrain linear on train set only (for a fair apples-to-apples comparison)
-lm_fit_eval <- lm(pct_commute_60p ~ ., data = train_data)
+## RUN EACH MODEL ACROSS THE FOLDS
+lm_cv        <- run_cv(folds, function(d) lm(pct_commute_60p ~ ., data = d))
+lm_spline_cv <- run_cv(folds, function(d) lm(pct_commute_60p ~ . - dist_subway_miles
+                                              + splines::ns(dist_subway_miles, df = 4),
+                                              data = d))
+rf_cv        <- run_cv(folds, function(d) randomForest(pct_commute_60p ~ ., data = d, ntree = 500))
 
-# Same with the spline on dist_subway_miles, for the eval-table comparison.
-lm_fit_spline_eval <- lm(pct_commute_60p ~ . - dist_subway_miles
-                         + splines::ns(dist_subway_miles, df = 4),
-                         data = train_data)
-
-## Train RF on train set (for evaluation)
-rf_fit_eval <- randomForest(
-  pct_commute_60p ~ .,
-  data       = train_data,
-  ntree      = 500,
-  importance = TRUE
-)
-
-## Train RF on full dataset (used for map predictions)
+## Train RF on full dataset (used for map predictions — outside the CV loop)
 rf_fit <- randomForest(
   pct_commute_60p ~ .,
   data       = model_data,
@@ -909,22 +921,101 @@ rf_fit <- randomForest(
   importance = TRUE
 )
 
-## EVALUATION on test set
-lm_preds        <- predict(lm_fit_eval,        newdata = test_data)
-lm_spline_preds <- predict(lm_fit_spline_eval, newdata = test_data)
-rf_preds        <- predict(rf_fit_eval,        newdata = test_data)
-actuals         <- test_data$pct_commute_60p
-
+## SUMMARIZE — mean ± SE across folds, plus the one-SE rule flag
 rmse <- function(a, p) sqrt(mean((a - p)^2))
 r2   <- function(a, p) 1 - sum((a - p)^2) / sum((a - mean(a))^2)
 
-eval_table <- tibble(
-  Model = c("Linear Regression", "Linear + Spline (dist_subway_miles)", "Random Forest"),
-  RMSE  = round(c(rmse(actuals, lm_preds), rmse(actuals, lm_spline_preds), rmse(actuals, rf_preds)), 3),
-  R2    = round(c(r2(actuals,   lm_preds), r2(actuals,   lm_spline_preds), r2(actuals,   rf_preds)), 3)
+fold_metrics <- function(cv_df) {
+  cv_df %>% group_by(fold) %>%
+    summarise(rmse_fold = rmse(actual, pred),
+              r2_fold   = r2(actual, pred),
+              .groups   = "drop")
+}
+
+cv_summary <- function(name, cv_df) {
+  m <- fold_metrics(cv_df)
+  tibble(
+    Model     = name,
+    RMSE_mean = mean(m$rmse_fold),
+    RMSE_SE   = sd(m$rmse_fold) / sqrt(nrow(m)),
+    R2_mean   = mean(m$r2_fold),
+    R2_SE     = sd(m$r2_fold)   / sqrt(nrow(m))
+  )
+}
+
+cv_table <- bind_rows(
+  cv_summary("Linear Regression",                  lm_cv),
+  cv_summary("Linear + Spline (dist_subway_miles)", lm_spline_cv),
+  cv_summary("Random Forest",                       rf_cv)
 )
 
-kable(eval_table, caption = "Model Comparison — 80/20 Test Set")
+# One-SE rule: any model within (best_RMSE + SE_of_best) is "as good as best".
+best_idx      <- which.min(cv_table$RMSE_mean)
+one_se_thresh <- cv_table$RMSE_mean[best_idx] + cv_table$RMSE_SE[best_idx]
+cv_table <- cv_table %>%
+  mutate(within_1se_of_best = ifelse(RMSE_mean <= one_se_thresh, "✓", ""))
+
+kable(cv_table %>% mutate(across(where(is.numeric), ~ round(., 3))),
+      caption = "10-fold CV (stratified by borough) — mean ± SE, one-SE rule flag")
+```
+
+#### RF Hyperparameter Tuning (mtry sweep, OOB)
+
+Per ISLP §8.2.1 and Meetup 8: with enough trees, OOB error is virtually equivalent to LOOCV — so we tune `mtry` by reading `rf$mse` off the full-data fit, no separate CV needed. ISLP's default is `mtry ≈ p/3` ≈ 7 for our 22 predictors; the sweep tests neighbors and the bagging endpoint (`mtry = 22`). We also verify `ntree = 500` is past the OOB plateau.
+
+If multiple `mtry` values come back within 1% of the OOB-best, we go with the **ISLP default** (`p/3 ≈ 7`) — the one-percent-rule analogue. Easier to defend than the algorithmic best when the spread is within Monte Carlo noise.
+
+```{r random-forest-tuning}
+## mtry SWEEP via OOB
+mtry_grid <- c(3, 5, 7, 11, 22)
+
+rf_tuning <- map_dfr(mtry_grid, function(m) {
+  set.seed(622)
+  fit <- randomForest(pct_commute_60p ~ ., data = model_data,
+                      mtry = m, ntree = 500)
+  tibble(
+    mtry     = m,
+    OOB_RMSE = sqrt(tail(fit$mse, 1)),
+    OOB_R2   = tail(fit$rsq, 1)
+  )
+})
+
+# Flag mtry values within ~1% of best — rough OOB analogue of the one-SE rule.
+best_oob <- min(rf_tuning$OOB_RMSE)
+rf_tuning <- rf_tuning %>%
+  mutate(within_1pct_of_best = ifelse(OOB_RMSE <= best_oob * 1.01, "✓", ""))
+
+kable(rf_tuning %>% mutate(across(where(is.numeric), ~ round(., 3))),
+      caption = "RF mtry sweep — OOB RMSE / R² on full data")
+
+## Refit production rf_fit with the chosen mtry
+# OOB-best is mtry=11 by 0.03 RMSE, but ISLP default p/3 ≈ 7 is within 1%.
+# Going with the simpler/standard default — easier to defend and statistically tied.
+chosen_mtry <- 7
+set.seed(622)
+rf_fit <- randomForest(
+  pct_commute_60p ~ .,
+  data       = model_data,
+  ntree      = 500,
+  mtry       = chosen_mtry,
+  importance = TRUE
+)
+cat("rf_fit refit with mtry =", chosen_mtry, "\n")
+
+## OOB-vs-ntree — confirm 500 trees is enough
+oob_curve <- tibble(
+  ntree    = seq_along(rf_fit$mse),
+  oob_rmse = sqrt(rf_fit$mse)
+)
+
+ggplot(oob_curve, aes(x = ntree, y = oob_rmse)) +
+  geom_line(color = "darkblue") +
+  geom_hline(yintercept = tail(oob_curve$oob_rmse, 1),
+             color = "red", linetype = "dashed") +
+  theme_minimal() +
+  labs(title = paste("OOB RMSE vs number of trees (mtry =", chosen_mtry, ")"),
+       subtitle = "Red dashed = final OOB RMSE — curve should plateau",
+       x = "Number of trees", y = "OOB RMSE")
 ```
 
 ### IBX Simulation
