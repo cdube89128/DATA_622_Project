@@ -64,6 +64,8 @@ The .Renviron file will open. Add the key:
 - RF IBX simulation — predicts commute relief under IBX scenario
 - RF residuals map layer — shows where the model over/under-predicts geographically
 - RF layers added to Shiny app alongside existing linear layers
+- Logit transform on the outcome so lm predictions stay in [0, 100]
+- Natural cubic spline on `dist_subway_miles` (kept alongside the linear baseline) — captures the saturating distance effect George flagged
 
 > **Tai's contributions (April 2026):** borough fixed effects, Random Forest model + evaluation, RF feature importance, RF IBX simulation, residuals map layer, RF Shiny app layers
 

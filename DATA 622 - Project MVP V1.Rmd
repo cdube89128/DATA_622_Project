@@ -32,12 +32,18 @@ pacman::p_load(
    janitor, # clean up the names of columns that have spaces (subway entrances data)
    tidygeocoder,
    broom,
-   cobalt
+   cobalt,
+   here     # project-root-aware paths (works interactive AND during knit)
 )
 
-#i just hard coded it becuase postiron was making it difficult
-#projPath <- "C:\\Users\\guill\\Documents\\GitHub\\DATA_622_Project"
-projPath <- dirname(file.path(getSourceEditorContext()$path))
+# Resolve projPath: source-editor path when interactive, here() during knit.
+# `here()` only works if your wd is inside the project — knit sets that, but
+# an interactive session might be running from your home dir.
+projPath <- if (interactive()) {
+  dirname(rstudioapi::getSourceEditorContext()$path)
+} else {
+  here::here()
+}
 ```
 
 
@@ -825,6 +831,9 @@ ml_data_raw <- readRDS(file.path(projPath, "data", "model_input.rds")) %>%
   select(all_of(c(id_vars, target_var, predictor_vars))) %>%
   drop_na()
 
+# Sanity: any Inf/NaN in the numeric columns? scale() turns Inf into NaN.
+print(ml_data_raw %>% summarise(across(where(is.numeric), ~ sum(!is.finite(.)))))
+
 ## SCALE THE DATA FOR THE MODEL
 # Scale numeric predictors only — borough is a factor and must not be z-scored
 numeric_predictors <- predictor_vars[predictor_vars != "borough"]
@@ -833,14 +842,27 @@ ml_data_scaled <- ml_data_raw %>%
   mutate(across(
     .cols = all_of(numeric_predictors),
     .fns  = ~ as.numeric(scale(.))
-  ))
+  )) %>%
+  # Logit-transform the outcome so lm predictions can't escape [0, 100].
+  # Small offset handles 0% / 100% edges without -Inf/+Inf.
+  mutate(pct_commute_60p_logit = qlogis((pct_commute_60p + 0.5) / 101))
+
+# Helper: bring logit-space predictions back to raw % space.
+logit_to_pct <- function(z) (plogis(z) * 101) - 0.5
 
 ## TRAIN THE MODEL
-# Train the model using the SCALED data
-lm_fit_standardized <- lm(pct_commute_60p ~ . - GEOID, data = ml_data_scaled)
+# Fit on the logit-transformed outcome — back-transform when we predict.
+lm_fit_standardized <- lm(pct_commute_60p_logit ~ . - GEOID - pct_commute_60p,
+                          data = ml_data_scaled)
+
+# Same model with a natural cubic spline on dist_subway_miles — kept alongside
+# the pure-linear baseline so we can compare them in the Shiny app.
+lm_fit_spline <- lm(pct_commute_60p_logit ~ . - GEOID - pct_commute_60p - dist_subway_miles
+                    + splines::ns(dist_subway_miles, df = 4),
+                    data = ml_data_scaled)
 
 print("Model Summary: ")
-summary(lm_fit_standardized) 
+summary(lm_fit_standardized)
 ```
 
 ### Model 2: Random Forest + Evaluation
@@ -866,6 +888,11 @@ test_data  <- model_data[-train_idx, ]
 ## Retrain linear on train set only (for a fair apples-to-apples comparison)
 lm_fit_eval <- lm(pct_commute_60p ~ ., data = train_data)
 
+# Same with the spline on dist_subway_miles, for the eval-table comparison.
+lm_fit_spline_eval <- lm(pct_commute_60p ~ . - dist_subway_miles
+                         + splines::ns(dist_subway_miles, df = 4),
+                         data = train_data)
+
 ## Train RF on train set (for evaluation)
 rf_fit_eval <- randomForest(
   pct_commute_60p ~ .,
@@ -883,17 +910,18 @@ rf_fit <- randomForest(
 )
 
 ## EVALUATION on test set
-lm_preds <- predict(lm_fit_eval, newdata = test_data)
-rf_preds <- predict(rf_fit_eval, newdata = test_data)
-actuals  <- test_data$pct_commute_60p
+lm_preds        <- predict(lm_fit_eval,        newdata = test_data)
+lm_spline_preds <- predict(lm_fit_spline_eval, newdata = test_data)
+rf_preds        <- predict(rf_fit_eval,        newdata = test_data)
+actuals         <- test_data$pct_commute_60p
 
 rmse <- function(a, p) sqrt(mean((a - p)^2))
 r2   <- function(a, p) 1 - sum((a - p)^2) / sum((a - mean(a))^2)
 
 eval_table <- tibble(
-  Model = c("Linear Regression", "Random Forest"),
-  RMSE  = round(c(rmse(actuals, lm_preds), rmse(actuals, rf_preds)), 3),
-  R2    = round(c(r2(actuals,   lm_preds), r2(actuals,   rf_preds)), 3)
+  Model = c("Linear Regression", "Linear + Spline (dist_subway_miles)", "Random Forest"),
+  RMSE  = round(c(rmse(actuals, lm_preds), rmse(actuals, lm_spline_preds), rmse(actuals, rf_preds)), 3),
+  R2    = round(c(r2(actuals,   lm_preds), r2(actuals,   lm_spline_preds), r2(actuals,   rf_preds)), 3)
 )
 
 kable(eval_table, caption = "Model Comparison — 80/20 Test Set")
@@ -951,7 +979,9 @@ ibx_tracts_sf <- st_filter(
 )
 
 # Extract just the 11-digit IDs as a clean list
-ibx_geoid_list <- ibx_tracts_sf$GEOID
+# Only keep tracts that made it into the modeling set, otherwise
+# treated tracts get no prediction and show up as map holes.
+ibx_geoid_list <- intersect(ibx_tracts_sf$GEOID, ml_data_scaled$GEOID)
 ```
 
 ```{r ibx-simulator-dataset-and-model}
@@ -968,15 +998,37 @@ ibx_scenario_data_scaled <- ml_data_scaled %>%
 
 # Predicted data is from the model which consumed scaled data
 # But we're using raw data so the display of neighborhood features is correct
+# lm predictions live in logit space — back-transform + clamp to [0, 100].
 final_map_data <- ml_data_raw %>%
   mutate(
-    predicted_commute_baseline = predict(lm_fit_standardized, newdata = ml_data_scaled),
-    predicted_commute_ibx      = predict(lm_fit_standardized, newdata = ibx_scenario_data_scaled),
-    ibx_commute_relief         = predicted_commute_baseline - predicted_commute_ibx,
+    predicted_commute_baseline = pmax(0, pmin(100, logit_to_pct(predict(lm_fit_standardized, newdata = ml_data_scaled)))),
+    predicted_commute_ibx      = pmax(0, pmin(100, logit_to_pct(predict(lm_fit_standardized, newdata = ibx_scenario_data_scaled)))),
+    ibx_commute_relief         = pmax(0, predicted_commute_baseline - predicted_commute_ibx),
     is_ibx_location            = ifelse(GEOID %in% ibx_geoid_list, 1, 0)
   )
 
-saveRDS(final_map_data, file.path(projPath, "data", "model_input.rds")) 
+# Sanity: where do predictions actually land?
+cat("lm baseline range:", range(final_map_data$predicted_commute_baseline), "\n")
+cat("lm IBX range:    ", range(final_map_data$predicted_commute_ibx), "\n")
+cat("lm relief range: ", range(final_map_data$ibx_commute_relief), "\n")
+
+saveRDS(final_map_data, file.path(projPath, "data", "model_input.rds"))
+```
+
+```{r ibx-spline-predictions}
+# Spline-lm IBX predictions — appended to final_map_data alongside the linear baseline.
+final_map_data <- final_map_data %>%
+  mutate(
+    predicted_commute_baseline_spline = pmax(0, pmin(100, logit_to_pct(predict(lm_fit_spline, newdata = ml_data_scaled)))),
+    predicted_commute_ibx_spline      = pmax(0, pmin(100, logit_to_pct(predict(lm_fit_spline, newdata = ibx_scenario_data_scaled)))),
+    ibx_commute_relief_spline         = pmax(0, predicted_commute_baseline_spline - predicted_commute_ibx_spline)
+  )
+
+cat("spline baseline range:", range(final_map_data$predicted_commute_baseline_spline), "\n")
+cat("spline IBX range:    ", range(final_map_data$predicted_commute_ibx_spline), "\n")
+cat("spline relief range: ", range(final_map_data$ibx_commute_relief_spline), "\n")
+
+saveRDS(final_map_data, file.path(projPath, "data", "model_input.rds"))
 ```
 
 ```{r ibx-rf-predictions}
@@ -984,10 +1036,16 @@ saveRDS(final_map_data, file.path(projPath, "data", "model_input.rds"))
 # final_map_data is still in memory — adding RF columns and re-saving.
 final_map_data_rf <- final_map_data %>%
   mutate(
-    predicted_commute_baseline_rf = predict(rf_fit, newdata = ml_data_scaled),
-    predicted_commute_ibx_rf      = predict(rf_fit, newdata = ibx_scenario_data_scaled),
-    ibx_commute_relief_rf         = predicted_commute_baseline_rf - predicted_commute_ibx_rf
+    # Restore Tai's clamps — % can't be negative, neither can relief.
+    predicted_commute_baseline_rf = pmax(0, predict(rf_fit, newdata = ml_data_scaled)),
+    predicted_commute_ibx_rf      = pmax(0, predict(rf_fit, newdata = ibx_scenario_data_scaled)),
+    ibx_commute_relief_rf         = pmax(0, predicted_commute_baseline_rf - predicted_commute_ibx_rf)
   )
+
+# Sanity: same range check for RF
+cat("RF baseline range:", range(final_map_data_rf$predicted_commute_baseline_rf), "\n")
+cat("RF IBX range:    ", range(final_map_data_rf$predicted_commute_ibx_rf), "\n")
+cat("RF relief range: ", range(final_map_data_rf$ibx_commute_relief_rf), "\n")
 
 saveRDS(final_map_data_rf, file.path(projPath, "data", "model_input.rds"))
 print("RF predictions appended to model_input.rds")
