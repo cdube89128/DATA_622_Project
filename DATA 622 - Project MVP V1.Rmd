@@ -328,8 +328,10 @@ ggplot(missing_map_data) +
   scale_fill_manual(values = c("Valid Data" = "#e0e0e0", "Missing Data" = "#d73027")) +
   theme_void() +
   labs(title = "Map of Missing Census Income Data",
-       fill = "Status") 
+       fill = "Status")
 ```
+
+**How to interpret:** Red tracts are missing the median income field; gray tracts have valid data. If the red dots cluster (same borough, same neighborhood), any model relying on `med_income` will be geographically biased — we'd be making predictions in those areas without real data. Scattered red is much less harmful.
 
 #### Census NA Handling
 
@@ -448,9 +450,11 @@ zone_lookup <- read_csv(file.path(projPath, 'taxi_zone_lookup.csv'))
 taxi_zones <- taxi_zones_sf %>%
   left_join(zone_lookup, by = c("LocationID" = "LocationID"))
 
-# Peak: Does this map look right 
+# Peak: Does this map look right
 plot(st_geometry(taxi_zones))
 ```
+
+**How to interpret:** Sanity check that the 263 NYC taxi zones loaded and overlay correctly. We're looking for a recognizable NYC silhouette — five boroughs visible, no obvious gaps or holes. If the shape looks broken, the shapefile didn't load right.
 
 ### TLC Data
 
@@ -827,7 +831,11 @@ borough_lookup <- c(
 
 # Derive borough from first 5 chars of GEOID and join onto the master table
 master_table <- readRDS(file.path(projPath, "data", "model_input.rds")) %>%
-  mutate(borough = factor(borough_lookup[substr(GEOID, 1, 5)]))
+  # Brooklyn as reference level — most-treated borough in the IBX corridor,
+  # so all other borough coefficients read as "vs Brooklyn (the IBX baseline)".
+  mutate(borough = factor(borough_lookup[substr(GEOID, 1, 5)],
+                          levels = c("Brooklyn", "Bronx", "Manhattan",
+                                     "Queens", "Staten Island")))
 
 saveRDS(master_table, file.path(projPath, "data", "model_input.rds"))
 print(table(master_table$borough))
@@ -1066,6 +1074,8 @@ ggplot(oob_curve, aes(x = ntree, y = oob_rmse)) +
        x = "Number of trees", y = "OOB RMSE")
 ```
 
+**How to interpret:** OOB error should drop fast, then plateau. If the curve flattens well before the right edge, 500 trees is enough. If it's still falling at the right edge, ntree should be higher. The dashed red line marks the final OOB value — looking for the curve to be hugging it.
+
 ### IBX Simulation
 
 Here, the approximate locations of the new IBX stations are being brought in. And then in the census areas where they go, we're basically dropping the distance to train for those areas to really low. There may be a more robust way of implementing the "simulation" of the IBX station than this, but this seemed like a good starting point.
@@ -1212,6 +1222,8 @@ ggplot(lm_results, aes(x = estimate, y = reorder(term, estimate))) +
        y = "Feature")
 ```
 
+**How to interpret:** Each point is a feature's standardized coefficient — how much logit(% long commute) shifts per 1 SD change in that feature, holding everything else fixed. Distance from zero = effect strength; the red dashed line marks "no effect." Borough effects (vs Brooklyn baseline) and `dist_to_manhattan_miles` tend to dominate. Error bars show ±1 SE — features whose bars cross zero aren't statistically distinguishable from zero effect.
+
 ```{r rf-feature-importance}
 # Variable importance from the full RF model
 rf_importance <- importance(rf_fit) %>%
@@ -1230,6 +1242,8 @@ ggplot(rf_importance, aes(x = `%IncMSE`, y = reorder(Feature, `%IncMSE`))) +
     y        = "Feature"
   )
 ```
+
+**How to interpret:** Higher %IncMSE = the feature mattered more for prediction (test error rises more when that feature is randomly shuffled). Compare to the lm coefficient plot — features ranking high in both are "robustly important." A feature high in RF but flat in lm typically means RF is capturing a nonlinear or interaction effect that lm can't.
 
 #### RF Residual Diagnostics
 
@@ -1276,6 +1290,8 @@ cat("Expected:    ", round(moran_test$estimate["Expectation"], 3),       "\n")
 cat("p-value:     ", format.pval(moran_test$p.value),                     "\n")
 ```
 
+**How to interpret the map:** Red = the model under-predicts (the real % long commute is *higher* than what the model expected). Blue = over-predicts. Patches of solid color = the model has a systematic geographic blind spot — a missing feature with spatial structure. A salt-and-pepper mix of red and blue = the model captures geography fine, residuals are just noise.
+
 How to read Moran's I:
 
 - I > 0 with low p: residuals cluster geographically — there's a spatial pattern the model is missing.
@@ -1313,7 +1329,8 @@ thinkCausal website:
 
 ```{r}
 # Drop ID column
-BART_data <- ml_data_scaled[, !(names(ml_data_scaled) %in% "GEOID")]
+BART_data <- ml_data_scaled[, !(names(ml_data_scaled) %in%
+                                c("GEOID", "pct_commute_60p_logit"))]
 BART_data <- na.omit(BART_data)
 
 # Outcome
@@ -1354,6 +1371,8 @@ legend("topright", legend = c("Treated", "Control"),
        fill = c(rgb(1,0,0,0.5), rgb(0,0,1,0.5)))
 ```
 
+**How to interpret:** Red = treated tracts, blue = untreated. Good overlap (the two distributions both span the same range) is required for trustworthy causal estimates. Poor overlap (e.g., red cluster at high values, blue at low) means the BART model has to extrapolate — comparing treated tracts to controls that don't really resemble them.
+
 Weighting for ATE, ATT, ATC
 ```{r}
 w_ate <- ifelse(z == 1, 1/ps, 1/(1 - ps))
@@ -1374,6 +1393,8 @@ ggplot(BART_df, aes(x = ps, fill = factor(z))) +
   labs(title = "Overlap (ATE)", fill = "Treatment")
 ```
 
+**How to interpret:** Same idea as the basic overlap plot, but reweighted for the **ATE** (effect on the average tract, treated or not). Tighter alignment between the two density curves = more trustworthy ATE estimate. Big gaps between curves at certain propensity values = those tracts have no good comparison group.
+
 ATT plot: Do control units resemble treated units?
 ```{r}
 # ATT
@@ -1382,6 +1403,8 @@ ggplot(BART_df, aes(x = ps, fill = factor(z))) +
   labs(title = "Overlap (ATT)", fill = "Treatment")
 ```
 
+**How to interpret:** Reweighted for the **ATT** — the effect on tracts that *received* treatment (the IBX corridor). Look for the control (blue) curve to match the shape of the treated (red) curve — that means we have similar-looking untreated tracts to compare each treated tract against.
+
 ATC plot: Do treated units resemble controls?
 ```{r}
 # ATC
@@ -1389,6 +1412,8 @@ ggplot(BART_df, aes(x = ps, fill = factor(z))) +
   geom_density(alpha = 0.4, aes(weight = w_atc)) +
   labs(title = "Overlap (ATC)", fill = "Treatment")
 ```
+
+**How to interpret:** Mirror image of the ATT plot — reweighted for tracts that *did not* receive treatment (everywhere except the IBX corridor). Good overlap here means we have treated tracts that resemble each control tract, so a hypothetical "if we treated this Bronx tract, what would happen?" estimate is well-grounded.
 
 2. Balance graph, poitns represent the treatment group (for ATE, ATT, and ATC).
 Each point = a covariate. X-axis = standardized mean difference (SMD). Two sets of points: Before weighting and after weighting.
@@ -1412,17 +1437,23 @@ love.plot(bal_ate, threshold = 0.1, abs = TRUE,
           title = "Covariate Balance (ATE)",stars = "raw",stats = "mean.diffs")
 ```
 
+**How to interpret:** Each dot is a covariate. X-axis = absolute standardized mean difference (SMD) between treated and untreated groups for that covariate. Dashed line at 0.1 marks the standard "balanced" threshold. Anything to the right of 0.1 means treated and control groups *differ meaningfully* on that variable — and the weighting hasn't fully fixed it. Two columns of dots compare before-weighting vs after-weighting.
+
 Covariate Balance (ATT)
 ```{r}
 love.plot(bal_att, threshold = 0.1, abs = TRUE,
           title = "Covariate Balance (ATT)", stars = "raw")
 ```
 
+**How to interpret:** Same as the ATE balance plot but reweighted for the ATT estimand. This is the most relevant of the three for our project since the IBX claim is "what does treatment do for the treated tracts." Anything past 0.1 here is a covariate where the comparison group doesn't quite match the treated group — flag-able for the writeup.
+
 Covariate Balance (ATC)
 ```{r}
 love.plot(bal_atc, threshold = 0.1, abs = TRUE,
           title = "Covariate Balance (ATC)",stars = "raw")
 ```
+
+**How to interpret:** Same again, but reweighted for the ATC. Less directly relevant to our IBX question, but useful as a diagnostic — covariates that are imbalanced for ATC but not ATT tell us where the model is making bigger extrapolation leaps for the *un*treated tracts.
 
 Fit our model:
 1. Causal Estimand: do we want ATE, ATT, and ATC? We're adding a new train line which is alittle different than just giving a new drug or something? I think we're most interested in ATT to measure how effective our treatment was for our area where we're adding it.
@@ -1476,6 +1507,8 @@ hist(ite[z == 1],
 abline(v = att, col = "red", lwd = 2)
 ```
 
+**How to interpret:** Distribution of individual treatment effects (ITE) across the *treated* tracts. The red vertical line is the ATT (average across treated). Negative ITE values = treatment reduces long-commute % (i.e. helps). All-negative = treatment uniformly helps every treated tract, which is what we want to see.
+
 Results:
 
 Subgroup analysis:
@@ -1493,6 +1526,8 @@ plot(ite_sorted, type = "l",
      main = "Treatment Effect Heterogeneity (Waterfall graph)")
 abline(h = 0, col = "red", lwd = 2)
 ```
+
+**How to interpret:** Every tract's ITE plotted in sorted order, smallest (most negative = biggest benefit) on the left, largest on the right. The red zero-line is the threshold — anything below it = treatment helps that tract. The slope tells you how heterogeneous the effects are: a steep curve = lots of variation in who benefits; a flat curve = effects are uniform.
 
 2. predictors of variation (tree depth graph)
 
@@ -1521,7 +1556,7 @@ ggplot(coef_df, aes(x = reorder(variable, effect), y = effect)) +
        y = "Effect on ITE")
 ```
 
-
+**How to interpret:** Each bar is a feature's coefficient when regressing BART's ITE on covariates *across all NYC tracts*. **Negative coefficient = bigger benefit (more negative ITE) per unit of that feature.** Positive = smaller benefit. Borough bars dominate because they capture geography that the continuous predictors don't. Coefficients for boroughs the IBX doesn't actually serve (Bronx, Manhattan, Staten Island) reflect BART's *extrapolation* of "what would happen if we did treat them" — interpret cautiously.
 
 ##### TREATED TRACTS ONLY: Among the treated units only, which covariates explain variation in their treatment effects?
 
@@ -1554,6 +1589,8 @@ ggplot(coef_df, aes(x = reorder(variable, effect), y = effect)) +
        y = "Effect on ITE")
 ```
 
+**How to interpret:** Same as the previous bar plot but limited to actually-treated tracts — no extrapolation. **More defensible** than the all-tracts version. Negative bar = feature is associated with bigger benefit. The boroughQueens bar (negative) means Queens treated tracts benefit more than Brooklyn treated tracts (Brooklyn is the reference). The continuous predictors are mostly small here — borough explains most of the heterogeneity.
+
 3. Exploratory subgroup analysis (histograms): explore treatment effect heterogeneity across subgroups
 
 Why are there MORE expected 60+ min commutes in brooklyn post treatment??? More stations should just reduce expected commute times, i dont understand, that number should fall. I think we' must've messed something up using our tracts geographic center for predicting commute times? 
@@ -1567,6 +1604,8 @@ ggplot(x_treated, aes(x = ite_treated)) +
   theme_minimal()
 ```
 
+**How to interpret:** ITE distribution among treated tracts, faceted by borough. All values being negative = treatment helps every treated tract in that borough (good). Boroughs whose histograms sit further left (more negative) benefit more on average. Width of the histogram = how heterogeneous treatment effects are within that borough.
+
 ```{r}
 ggplot(x_treated, aes(x = ite_treated, color = borough)) +
   geom_density(size = 1) +
@@ -1575,6 +1614,8 @@ ggplot(x_treated, aes(x = ite_treated, color = borough)) +
        y = "Density") +
   theme_minimal()
 ```
+
+**How to interpret:** Smoothed version of the histograms above, easier to compare across boroughs at a glance. The further left a borough's curve sits, the bigger the average benefit. Tight curves = uniform effects within that borough; wide curves = heterogeneous effects (some tracts benefit a lot, others less).
 
 Tree-based subgroup discovery for just treatment group only: Which splits in covariates create groups with different treatment effects?
 ```{r}
@@ -1585,6 +1626,8 @@ tree_model <- rpart(ite_treated ~ ., data = x_treated, method = "anova", control
 
 rpart.plot(tree_model, main = "Subgroups Driving Treatment Effect Heterogeneity")
 ```
+
+**How to interpret:** A regression tree on ITE for treated tracts only. Each split is the question that best separates "tracts with bigger benefit" from "tracts with smaller benefit." Each terminal node shows the predicted ITE for tracts that follow that path (the % at the bottom shows what share of tracts ended up there). Read top-to-bottom along a branch to identify "tracts with feature X beyond Y benefit Z amount."
 
 #### SPATIAL LAGS: include averages of neighboring tract values to account for spatial autocorrelation
 
