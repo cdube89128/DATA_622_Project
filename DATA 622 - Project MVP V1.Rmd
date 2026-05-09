@@ -674,6 +674,33 @@ saveRDS(subway_dist_lookup, file.path(projPath, "data", "subway_dist_lookup.rds"
 print("Subway distance feature successfully calculated from MTA data!")
 ```
 
+### Distance to Manhattan (CBD)
+
+Borough fixed effects can't tell apart "Williamsburg, 1 mile from Manhattan" and "Bay Ridge, 8 miles away" — they're both Brooklyn, same borough effect. This chunk computes distance from each tract to **Grand Central Terminal** as a CBD-proximity proxy. Per George's flag.
+
+```{r manhattan-distance}
+## Distance from each tract to Grand Central — proxy for "proximity to the
+## Manhattan CBD". Same point_on_surface reference points as subway distance.
+
+# Grand Central Terminal: 40.7527° N, 73.9772° W
+grand_central <- st_sfc(st_point(c(-73.9772, 40.7527)), crs = 4326) %>%
+  st_transform(2263)  # NYC State Plane (feet)
+
+tract_centers_pos <- st_point_on_surface(nyc_tracts_proj)
+
+manhattan_dist_lookup <- nyc_tracts_proj %>%
+  as_tibble() %>%
+  mutate(
+    dist_to_manhattan_miles = as.numeric(
+      st_distance(tract_centers_pos, grand_central)
+    ) / 5280
+  ) %>%
+  select(GEOID, dist_to_manhattan_miles)
+
+saveRDS(manhattan_dist_lookup, file.path(projPath, "data", "manhattan_dist_lookup.rds"))
+print("Distance to Manhattan (Grand Central) feature saved.")
+```
+
 ## Assembling
 
 ### Big Join
@@ -686,6 +713,7 @@ census_features <- readRDS(file.path(projPath, "data", "nyc_census_tracts.rds"))
 bike_counts     <- readRDS(file.path(projPath, "data", "processed_bike_counts.rds"))
 tlc_counts      <- readRDS(file.path(projPath, "data", "processed_tlc_counts.rds"))
 subway_dist     <- readRDS(file.path(projPath, "data", "subway_dist_lookup.rds"))
+manhattan_dist  <- readRDS(file.path(projPath, "data", "manhattan_dist_lookup.rds"))
 
 # Before joining, force each Tract to belong to only one Taxi Zone, the one it overlaps most.
 # I was seeing repeating values of income and distance for different zones in the final data set back when I was not doing this. 
@@ -706,7 +734,9 @@ master_table <- census_features %>%
   # Uber/Taxi counts  
   left_join(tlc_counts, by = "GEOID") %>% 
   # Subway Distance (already at Tract level)
-  left_join(subway_dist, by = "GEOID")
+  left_join(subway_dist, by = "GEOID") %>%
+  # Distance to Manhattan CBD (Grand Central proxy)
+  left_join(manhattan_dist, by = "GEOID")
 
 
 # Clean up NAs; create the Target Variable
@@ -831,6 +861,7 @@ predictor_vars <- c(
 
   # Infrastructure & Mobility
   "stations_per_sq_mile", "stations_per_1000_pop", "dist_subway_miles",
+  "dist_to_manhattan_miles",
   "uber_trips_per_capita", "bike_trips_per_capita",
 
   # Economic & Housing
@@ -1147,7 +1178,11 @@ final_map_data_rf <- final_map_data %>%
     # Restore Tai's clamps — % can't be negative, neither can relief.
     predicted_commute_baseline_rf = pmax(0, predict(rf_fit, newdata = ml_data_scaled)),
     predicted_commute_ibx_rf      = pmax(0, predict(rf_fit, newdata = ibx_scenario_data_scaled)),
-    ibx_commute_relief_rf         = pmax(0, predicted_commute_baseline_rf - predicted_commute_ibx_rf)
+    ibx_commute_relief_rf         = pmax(0, predicted_commute_baseline_rf - predicted_commute_ibx_rf),
+    # Residual: positive = model under-predicts (actual > predicted),
+    #           negative = model over-predicts (actual < predicted).
+    # Used by the Shiny app's residual layer.
+    rf_residual                   = pct_commute_60p - predicted_commute_baseline_rf
   )
 
 # Sanity: same range check for RF
@@ -1196,6 +1231,65 @@ ggplot(rf_importance, aes(x = `%IncMSE`, y = reorder(Feature, `%IncMSE`))) +
   )
 ```
 
+#### RF Residual Diagnostics
+
+If RF residuals cluster geographically, the model is missing a feature with spatial structure (likely "proximity to Manhattan" per George's flag). The map shows where the model under- or over-predicts; Moran's I quantifies whether the clustering is statistically meaningful.
+
+```{r rf-residual-diagnostic}
+library(spdep)
+
+## RESIDUAL MAP
+residual_map_data <- final_map_data_rf %>%
+  select(GEOID, rf_residual) %>%
+  left_join(nyc_tracts_clean %>% select(GEOID, geometry), by = "GEOID") %>%
+  st_as_sf()
+
+# Symmetric color scale capped at p99 of |residual| for readability
+cap <- quantile(abs(residual_map_data$rf_residual), 0.99, na.rm = TRUE)
+
+ggplot(residual_map_data) +
+  geom_sf(aes(fill = rf_residual), color = NA) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red",
+                       midpoint = 0,
+                       limits = c(-cap, cap),
+                       oob = scales::squish) +
+  theme_void() +
+  labs(title = "RF residuals — actual minus predicted % long commute",
+       subtitle = "Red = model under-predicts | Blue = model over-predicts",
+       fill = "Residual\n(pp)")
+
+## MORAN'S I — is the geographic clustering statistically real?
+tracts_for_moran <- nyc_tracts_clean %>%
+  filter(GEOID %in% final_map_data_rf$GEOID) %>%
+  arrange(match(GEOID, final_map_data_rf$GEOID))
+
+neighbors_local <- poly2nb(tracts_for_moran)
+weights_local   <- nb2listw(neighbors_local, style = "W", zero.policy = TRUE)
+
+moran_test <- moran.test(final_map_data_rf$rf_residual,
+                         weights_local,
+                         zero.policy = TRUE,
+                         na.action  = na.omit)
+
+cat("Moran's I:   ", round(moran_test$estimate["Moran I statistic"], 3), "\n")
+cat("Expected:    ", round(moran_test$estimate["Expectation"], 3),       "\n")
+cat("p-value:     ", format.pval(moran_test$p.value),                     "\n")
+```
+
+How to read Moran's I:
+
+- I > 0 with low p: residuals cluster geographically — there's a spatial pattern the model is missing.
+- I ≈ 0: residuals are spatially random — the model captures geographic structure well.
+- I < 0: residuals checkerboard (rare in real data) — would be unusual.
+
+**The Moran's I value above is *after* we added `dist_to_manhattan_miles`.** Before that feature, Moran's I was 0.079 (p < 10⁻¹⁰) — a much stronger spatial signal. Adding distance to Grand Central as a CBD-proximity proxy:
+
+- Cut Moran's I roughly in half (0.079 → 0.036)
+- Reduced cross-validated RMSE by 0.3–0.4 across all three models
+- Caused several previously-significant coefficients (borough effects for Brooklyn and Queens, `uber_trips_per_capita`, `pop_density`) to lose their inflated magnitudes — they had been silently proxying for Manhattan proximity
+- Tightened spline-vs-RF IBX agreement to ~0.5pp (was ~1.4pp)
+
+The pure linear baseline now predicts ~0pp IBX relief: its coefficient on `dist_subway_miles` shrank to -0.008. The spline and RF, which can capture the saturating subway-access effect, both predict ~7-8pp — much closer agreement than before (5.5pp vs 6.9pp).
 
 ### BART (Bayesian Additive Regression Trees)
 Predicts the effect of an intervention (e.g., a new medicine) by combining hundreds of small, simple decision trees to model complex, non-linear relationships, even without explicit programming. It excels at estimating, "What would have happened to this specific person if they had taken the treatment?". 
