@@ -521,11 +521,16 @@ intersection <- st_intersection(nyc_tracts_proj, taxi_zones_proj) %>%
 # What % of Tract X's area is inside Taxi Zone Y?
 tract_weights <- intersection %>%
   as_tibble() %>%
+  # Two complementary shares — different jobs, different denominators:
+  # tract_share = how much of this tract is in this zone (picks the dominant zone)
+  # zone_share  = how much of this zone is in this tract (apportions zone trips)
   group_by(GEOID) %>%
-  mutate(total_tract_area = sum(intersect_area)) %>%
+  mutate(tract_share = as.numeric(intersect_area / sum(intersect_area))) %>%
   ungroup() %>%
-  mutate(weight = as.numeric(intersect_area / total_tract_area)) %>%
-  select(GEOID, LocationID, zone, weight)
+  group_by(LocationID) %>%
+  mutate(zone_share = as.numeric(intersect_area / sum(intersect_area))) %>%
+  ungroup() %>%
+  select(GEOID, LocationID, zone, tract_share, zone_share)
 
 # Peak Crosswalk 
 head(tract_weights)
@@ -539,7 +544,7 @@ The below chunk uses the newly defined geography, and then it disperses the uber
 
 tract_vehicular_estimates <- tract_weights %>%
   left_join(total_zone_counts, by = c("LocationID" = "PULocationID")) %>%
-  mutate(estimated_trips = total_vehicular_trips * weight) %>%
+  mutate(estimated_trips = total_vehicular_trips * zone_share) %>%
   group_by(GEOID) %>%
   summarize(total_uber_taxi_trips = sum(estimated_trips, na.rm = TRUE))
 
@@ -643,9 +648,11 @@ subway_entrances_sf <- subway_raw %>%
   st_as_sf(coords = c("entrance_longitude", "entrance_latitude"), crs = 4326) %>% # telling it to read this as 4326, the standard GPS coordinate system  
   st_transform(2263) # Converting to the same 1 unit = 1 foot NYC-specific map that was used earlier
 
-# Centroids
-# Find the center point of every Census Tract
-tract_centers <- st_centroid(nyc_tracts_proj)
+# Picking a reference point inside each tract.
+# Switched away from st_centroid() — for L-shaped or coastal tracts the
+# geographic center can land in water or in a corner where nobody lives.
+# st_point_on_surface() is guaranteed to be inside the polygon.
+tract_centers <- st_point_on_surface(nyc_tracts_proj)
 
 # Nearest Entrance for every Tract
 # Find the closest subway for each tract
@@ -684,7 +691,7 @@ subway_dist     <- readRDS(file.path(projPath, "data", "subway_dist_lookup.rds")
 # I was seeing repeating values of income and distance for different zones in the final data set back when I was not doing this. 
 unique_weights <- tract_weights %>%
   group_by(GEOID) %>%
-  slice_max(weight, n = 1, with_ties = FALSE) %>% 
+  slice_max(tract_share, n = 1, with_ties = FALSE) %>% 
   ungroup() %>%
   select(GEOID, LocationID, zone) # Keep the Zone name and ID for joining
 
@@ -807,6 +814,8 @@ Both fit on a **logit-transformed outcome** so predictions stay in [0, 100] (wit
 
 The spline version handles the saturating distance effect George flagged — closer matters a lot, far doesn't (ISLP §7.4 prescribes natural cubic splines for this case). Linear baseline kept alongside so the Shiny app can show both.
 
+Heavy-tailed predictors (`uber_trips_per_capita`, `bike_trips_per_capita`, `stations_per_1000_pop`, `pop_density`) get a `log1p()` transform before z-scoring — same idea, also George's flag. After logging, a 1 SD change in the standardized predictor is an order-of-magnitude change rather than an absolute one, which is the right scale for these variables.
+
 ```{r machine-learning-poc}
 # The selection for the Machine Learning model
 # Right now, this has a lot of room for improvement trimming or adding features 
@@ -848,6 +857,14 @@ print(ml_data_raw %>% summarise(across(where(is.numeric), ~ sum(!is.finite(.))))
 numeric_predictors <- predictor_vars[predictor_vars != "borough"]
 
 ml_data_scaled <- ml_data_raw %>%
+  # Log-transform heavy-tailed predictors before scaling so standardized
+  # values reflect order-of-magnitude differences (per George's flag re:
+  # citibike share, uber/taxi share, plus pop_density spans 4 orders).
+  mutate(across(
+    .cols = c(uber_trips_per_capita, bike_trips_per_capita,
+              stations_per_1000_pop, pop_density),
+    .fns  = log1p
+  )) %>%
   mutate(across(
     .cols = all_of(numeric_predictors),
     .fns  = ~ as.numeric(scale(.))
