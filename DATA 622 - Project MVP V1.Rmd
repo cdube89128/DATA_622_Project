@@ -35,7 +35,8 @@ pacman::p_load(
    cobalt,
    here,    # project-root-aware paths (works interactive AND during knit)
    rsample,  # k-fold CV
-   rlang
+   rlang,
+   randomForest
 )
 
 # Resolve projPath: source-editor path when interactive, here() during knit.
@@ -809,13 +810,20 @@ print(top_uber)
 ```
 
 
-## Model Building (Super Duper Rough, Proof of Concept)
+## Model Building 
 
-This is currently a simple linear model for proof of concept. We'll be able to build up something much more robust .
+This section has 3 predictive models:
 
+* Linear Regression "baseline" model. 
+* A linear model with a natural cubic spline on `dist_subway_miles`
+* A random forest model
+
+It also has 1 causal model
+* BART, to estimate the average treatment effect
+ 
 ### Borough Fixed Effects
 
-Professor flagged that NYC neighborhoods are very different from each other — a feature value in the Bronx means something different than the same value in Manhattan. Adding borough as a factor variable lets both models learn a borough-level intercept, capturing unobserved variation that our census features don't fully explain.
+Prof. George flagged that NYC neighborhoods are very different from each other. Added this section, and borough as a factor variable lets both models learn a borough-level intercept, capturing unobserved variation that our census features don't fully explain.
 
 Borough is derived from the first 5 digits of GEOID (standard Census FIPS codes) so no additional data pull is needed.
 
@@ -841,18 +849,18 @@ saveRDS(master_table, file.path(projPath, "data", "model_input.rds"))
 print(table(master_table$borough))
 ```
 
-### Model 1: Linear Regression (with and without spline)
+### Models 1 and 2: Linear Regression (with and without spline)
 
 Two linear baselines:
 
-- `lm_fit_standardized` — pure linear regression
-- `lm_fit_spline` — same model + a natural cubic spline on `dist_subway_miles`
+* `lm_fit_standardized`: pure linear regression
+* `lm_fit_spline`L same model + a natural cubic spline on `dist_subway_miles`
 
-Both fit on a **logit-transformed outcome** so predictions stay in [0, 100] (without it, plain `lm` will happily predict -3% or 105% when IBX pushes one feature to an extreme).
+Updated this section so that both fit on a logit-transformed outcome so predictions stay in [0, 100]. (Without it, `lm` was predicting percentages that didn't make sense because they were outsid ethat range).
 
-The spline version handles the saturating distance effect George flagged — closer matters a lot, far doesn't (ISLP §7.4 prescribes natural cubic splines for this case). Linear baseline kept alongside so the Shiny app can show both.
+The spline version handles the saturating distance effect Prof. George flagged. When the distance to the subway is closer it matters a lot, far doesn't.
 
-Heavy-tailed predictors (`uber_trips_per_capita`, `bike_trips_per_capita`, `stations_per_1000_pop`, `pop_density`) get a `log1p()` transform before z-scoring — same idea, also George's flag. After logging, a 1 SD change in the standardized predictor is an order-of-magnitude change rather than an absolute one, which is the right scale for these variables.
+Heavy-tailed predictors (`uber_trips_per_capita`, `bike_trips_per_capita`, `stations_per_1000_pop`, `pop_density`) get a `log1p()` transform before z-scoring. Prof. George also pointed this out at some point, that some of these variables would have heavily skewed distributions. After logging, a 1 SD change in the standardized predictor is an order-of-magnitude change rather than an absolute one, which is the right scale for these variables.
 
 ```{r machine-learning-poc}
 # The selection for the Machine Learning model
@@ -930,20 +938,19 @@ print("Model Summary: ")
 summary(lm_fit_standardized)
 ```
 
-### Model 2: Random Forest + 10-fold Cross-Validation
+### Model 3: Random Forest + 10-fold Cross-Validation
 
-We compare three models — pure linear, linear+spline, and Random Forest — using 10-fold CV stratified by borough. Same folds for every model so the RMSE/R² comparisons are paired (ISLP Ch. 5 / Meetup 6). The **one-SE rule** then picks among them.
+Two jobs in this section: train the Random Forest (Model 3), and put all three models through 10-fold cross-validation to compare them "head-to-head".
 
-A single 80/20 split — what we had before — is the high-variance case ISLP §5.1.1 explicitly warns against. CV averages out the fold-level noise.
+CV mechanics: each model is fit 10 times (once per fold, on the 90% training side) and predicted on the held-out 10%. Folds are stratified by borough and reused across all three models, so the RMSE / R-squared comparisons are paired. The "one-SE rule" then picks the simplest model within one SE of the best.
 
-`rf_fit` is fit on the full dataset (no holdout) for the IBX simulation downstream — separate from the CV loop.
+A separate fit of `rf_fit` on the full dataset happens at the end (that's the version used by the IBX simulation downstream, separate from the CV loop).
 
-```{r random-forest-model}
-library(randomForest)
 
+```{r random-forest-model} 
 ## CV SETUP
 # 10-fold CV stratified by borough — same folds for every model so RMSE/R^2
-# comparisons are paired (per ISLP Ch. 5 / Meetup 6).
+# comparisons are paired 
 set.seed(622)
 model_data <- ml_data_scaled[, c(target_var, predictor_vars)]
 folds <- rsample::vfold_cv(model_data, v = 10, strata = borough)
@@ -977,7 +984,8 @@ rf_fit <- randomForest(
   importance = TRUE
 )
 
-## SUMMARIZE — mean ± SE across folds, plus the one-SE rule flag
+## SUMMARIZE
+## mean +- SE across folds, plus the one-SE rule flag
 rmse <- function(a, p) sqrt(mean((a - p)^2))
 r2   <- function(a, p) 1 - sum((a - p)^2) / sum((a - mean(a))^2)
 
@@ -1015,11 +1023,13 @@ kable(cv_table %>% mutate(across(where(is.numeric), ~ round(., 3))),
       caption = "10-fold CV (stratified by borough) — mean ± SE, one-SE rule flag")
 ```
 
-#### RF Hyperparameter Tuning (mtry sweep, OOB)
+**Interpretation:** Random Forest wins clearly; it's the only model within 1 SE of the best, and each step up (linear → spline → RF) gains predictive power. The spline-to-RF gap (`r round(cv_table$RMSE_mean[3] - cv_table$RMSE_mean[2], 2)` RMSE) is bigger than the lm-to-spline gap (`r round(cv_table$RMSE_mean[2] - cv_table$RMSE_mean[1], 2)`), meaning RF is catching nonlinearities and interactions the spline alone can't. RF's typical prediction is off by ~`r round(cv_table$RMSE_mean[3], 1)`pp on the 0-100% scale and explains ~`r round(cv_table$R2_mean[3] * 100)`% of variance. For the IBX simulation, Models 2 and 3 are better to lean on. Model 1 can't capture the saturating subway-access effect, so its predicted relief is essentially zero.
 
-Per ISLP §8.2.1 and Meetup 8: with enough trees, OOB error is virtually equivalent to LOOCV — so we tune `mtry` by reading `rf$mse` off the full-data fit, no separate CV needed. ISLP's default is `mtry ≈ p/3` ≈ 7 for our 22 predictors; the sweep tests neighbors and the bagging endpoint (`mtry = 22`). We also verify `ntree = 500` is past the OOB plateau.
+P.s. the "saturating subway-access effect" was just the most succinct way I could phrase "the effect where 5 minutes versus 10 minutes as a walk to the subway is a big different, but 20 minutes versus 25 is not". Ajs Prof. George pointed this out to us in feedback notes at some point in time.
 
-If multiple `mtry` values come back within 1% of the OOB-best, we go with the **ISLP default** (`p/3 ≈ 7`) — the one-percent-rule analogue. Easier to defend than the algorithmic best when the spread is within Monte Carlo noise.
+#### RF Tuning: mtry sweep via OOB
+
+`mtry` is the knob for how many features RF considers at each tree split. Tuning it using OOB error instead of a full CV loop (ISLP says they're basically equivalent with enough trees, and OOB is faster). The sweep covers the default p/3 ≈ 7, a few neighbors, and mtry = 22 (which is plain bagging and useful as a control). If multiple values come back within 1% of the best, the default is being picked becuase it's "cleaner" to defend than the algorithmic min when the gaps are tiny.
 
 ```{r random-forest-tuning}
 ## mtry SWEEP via OOB
@@ -1075,6 +1085,8 @@ ggplot(oob_curve, aes(x = ntree, y = oob_rmse)) +
 ```
 
 **How to interpret:** OOB error should drop fast, then plateau. If the curve flattens well before the right edge, 500 trees is enough. If it's still falling at the right edge, ntree should be higher. The dashed red line marks the final OOB value — looking for the curve to be hugging it.
+
+**Interpretation:** mtry sweep was a near-tie — the algorithmic best was mtry=`r rf_tuning$mtry[which.min(rf_tuning$OOB_RMSE)]` at OOB RMS `r round(min(rf_tuning$OOB_RMSE), 3)`, but `r sum(rf_tuning$within_1pct_of_best == "✓")` of 5 values landed within 1% of the best, so we went with ISLP's default mtry=7 (RMSE `r round(rf_tuning$OOB_RMSE[rf_tuning$mtry == 7], 3)`). That mtry=2 (essentially bagging) is only marginally worse tells us feature decorrelation isn't doing heavy lifting on this dataset. The OOB-vs-ntree curve drops fast from ~`r round(oob_curve$oob_rmse[1], 1)` at ntree=1 to ~`r round(oob_curve$oob_rmse[200], 2)` by ntree=200, then flatlines through 500 — confirming ntree=500 is well past the plateau. Could safely cut to ~300 trees, but 500 is standard so we kept it.
 
 ### IBX Simulation
 
@@ -1132,6 +1144,8 @@ ibx_tracts_sf <- st_filter(
 # treated tracts get no prediction and show up as map holes.
 ibx_geoid_list <- intersect(ibx_tracts_sf$GEOID, ml_data_scaled$GEOID)
 ```
+
+The IBX simulation works like this: geocode the 19 IBX station addresses, draw 0.5-mile walksheds around each, and flag every tract that intersects a walkshed as "treated." For treated tracts we set `dist_subway_miles` to the city-wide minimum (i.e., "this tract now has subway access as close as the best-served tract in NYC") and re-predict commute outcomes. The same setup runs through all three predictive models (linear, spline, RF) so we can compare how each forecasts IBX's effect. It's a coarse proxy for what a real subway station does, but a defensible starting point.
 
 ```{r ibx-simulator-dataset-and-model}
 ## Create an IBX UNIVERSE data set
@@ -1224,6 +1238,9 @@ ggplot(lm_results, aes(x = estimate, y = reorder(term, estimate))) +
 
 **How to interpret:** Each point is a feature's standardized coefficient — how much logit(% long commute) shifts per 1 SD change in that feature, holding everything else fixed. Distance from zero = effect strength; the red dashed line marks "no effect." Borough effects (vs Brooklyn baseline) and `dist_to_manhattan_miles` tend to dominate. Error bars show ±1 SE — features whose bars cross zero aren't statistically distinguishable from zero effect.
 
+**Interpretation:** Distance to Manhattan and being in Manhattan are the dominant features. Together they carry most of the geography story (more distance from Manhattan → more long commutes; Manhattan itself strongly fewer). The most counterintuitive coefficient is `pct_transit` (`r sprintf("%+.2f", lm_results$estimate[lm_results$term == "pct_transit"])`, p < 10⁻¹⁶) — tracts where more people commute by transit have more
+long commutes, reflecting NYC's reality that long-distance commuters disproportionately use the subway. Distance to subway in the linear model is essentially zero (`r sprintf("%+.3f", lm_results$estimate[lm_results$term == "dist_subway_miles"])`, p=`r round(lm_results$p.value[lm_results$term == "dist_subway_miles"], 2)`); the relationship is saturating, which is why we added the spline. After controlling for distance to Manhattan, Queens and Bronx are statistical ties with Brooklyn; only Manhattan and Staten Island stand out as boroughs with meaningfully fewer long commutes.
+
 ```{r rf-feature-importance}
 # Variable importance from the full RF model
 rf_importance <- importance(rf_fit) %>%
@@ -1244,6 +1261,24 @@ ggplot(rf_importance, aes(x = `%IncMSE`, y = reorder(Feature, `%IncMSE`))) +
 ```
 
 **How to interpret:** Higher %IncMSE = the feature mattered more for prediction (test error rises more when that feature is randomly shuffled). Compare to the lm coefficient plot — features ranking high in both are "robustly important." A feature high in RF but flat in lm typically means RF is capturing a nonlinear or interaction effect that lm can't.
+
+**Interpretation:** RF's top three features — `pct_transit`,
+`dist_to_manhattan_miles`, and `pct_wfh` — are largely the same top
+features the linear model picked, so the predictive story holds across
+model classes. The big difference: `dist_subway_miles` ranks
+#`r which(rf_importance$Feature == "dist_subway_miles")` in RF
+(%IncMSE =
+`r round(rf_importance$"%IncMSE"[rf_importance$Feature == "dist_subway_miles"], 1)`)
+despite being essentially zero in the linear model
+(`r sprintf("%+.3f", lm_results$estimate[lm_results$term == "dist_subway_miles"])`,
+p=`r round(lm_results$p.value[lm_results$term == "dist_subway_miles"], 2)`)
+— clean confirmation that the relationship is nonlinear, which is
+exactly what the spline was meant to capture. `borough` only ranks
+#`r which(rf_importance$Feature == "borough")` here — RF can use the
+continuous geographic features directly, so it leans less on the
+categorical borough proxy than the lm does. The bottom of the list
+(age buckets, `pct_vacant`) carries little predictive weight;
+candidates for trimming if we ever wanted a leaner feature set.
 
 #### RF Residual Diagnostics
 
