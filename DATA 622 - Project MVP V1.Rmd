@@ -938,11 +938,52 @@ print("Model Summary: ")
 summary(lm_fit_standardized)
 ```
 
+#### Spatial lag features
+
+For each geographic predictor below, we compute the neighbor-weighted average (the "spatial lag"). This lets a model express patterns like "a tract's commute outcomes depend on its own features AND on its neighbors' features." We keep the original predictors as-is so we can compare with-lag vs. without-lag model performance directly.
+
+```{r build-spatial-lags}
+library(spdep)
+library(sf)
+
+# Same spatial weights pattern as the residual diagnostic. Row order matches
+# ml_data_scaled, so lag.listw is correctly positional.
+tracts_sf <- nyc_tracts_clean %>%
+  filter(GEOID %in% ml_data_scaled$GEOID) %>%
+  arrange(match(GEOID, ml_data_scaled$GEOID))
+
+neighbors <- poly2nb(tracts_sf)
+weights   <- nb2listw(neighbors, style = "W", zero.policy = TRUE)
+
+# Predictors with the most geographic structure. Skipping the outcome
+# (lag-of-outcome opens the SAR can of worms) and skipping categorical
+# borough (lag of factor levels is awkward).
+predictors_to_lag <- c(
+  "dist_to_manhattan_miles", "dist_subway_miles",
+  "pop_density", "pct_transit", "pct_wfh",
+  "med_income", "stations_per_1000_pop"
+)
+
+# Compute each lag column inside ml_data_scaled.
+for (col in predictors_to_lag) {
+  ml_data_scaled[[paste0("lag_", col)]] <-
+    lag.listw(weights, ml_data_scaled[[col]], zero.policy = TRUE)
+}
+
+# Sanity: no Inf/NaN in the new lag columns
+lag_finite_check <- ml_data_scaled %>%
+  select(starts_with("lag_")) %>%
+  summarise(across(everything(), ~ sum(!is.finite(.))))
+print(lag_finite_check)
+```
+
 ### Model 3: Random Forest + 10-fold Cross-Validation
 
-Two jobs in this section: train the Random Forest (Model 3), and put all three models through 10-fold cross-validation to compare them "head-to-head".
+Three jobs in this section: train the Random Forest (Model 3), build the spatial-lag variants of all three models (Linear, Linear + Spline, Random Forest), and put all six variants through 10-fold cross-validation to compare them to one another.
 
-CV mechanics: each model is fit 10 times (once per fold, on the 90% training side) and predicted on the held-out 10%. Folds are stratified by borough and reused across all three models, so the RMSE / R-squared comparisons are paired. The "one-SE rule" then picks the simplest model within one SE of the best.
+The spatial-lag variants use the same model formulas as the non-spatial ones, with the neighbor-weighted `lag_*` columns from the previous chunk added to the predictor set.
+
+CV mechanics: each variant is fit 10 times (once per fold, on the 90% training side) and predicted on the held-out 10%. Folds are stratified by borough and reused across all six variants (same seed, same `vfold_cv` call), so any pair of models is directly comparable. The "one-SE rule" then picks the simplest model within one SE of the best.
 
 A separate fit of `rf_fit` on the full dataset happens at the end (that's the version used by the IBX simulation downstream, separate from the CV loop).
 
@@ -953,6 +994,15 @@ A separate fit of `rf_fit` on the full dataset happens at the end (that's the ve
 # comparisons are paired 
 set.seed(622)
 model_data <- ml_data_scaled[, c(target_var, predictor_vars)]
+
+# Spatial-lag predictor set: original predictors + the lag_* columns added
+# in the build-spatial-lags chunk. Same target, same row order.
+spatial_predictor_vars <- c(
+  predictor_vars,
+  paste0("lag_", predictors_to_lag)
+)
+model_data_spatial <- ml_data_scaled[, c(target_var, spatial_predictor_vars)]
+
 folds <- rsample::vfold_cv(model_data, v = 10, strata = borough)
 
 # Fit one model on the analysis side of a fold, predict on the assessment side.
@@ -976,10 +1026,41 @@ lm_spline_cv <- run_cv(folds, function(d) lm(pct_commute_60p ~ . - dist_subway_m
                                               data = d))
 rf_cv        <- run_cv(folds, function(d) randomForest(pct_commute_60p ~ ., data = d, ntree = 500))
 
+## SPATIAL-LAG VARIANTS: same models, same folds (same seed + same rows),
+## but using model_data_spatial so the lag_* columns enter as predictors.
+set.seed(622)
+folds_spatial <- rsample::vfold_cv(model_data_spatial, v = 10, strata = borough)
+
+lm_cv_spatial        <- run_cv(folds_spatial, function(d) lm(pct_commute_60p ~ ., data = d))
+lm_spline_cv_spatial <- run_cv(folds_spatial, function(d) lm(pct_commute_60p ~ . - dist_subway_miles
+                                                              + splines::ns(dist_subway_miles, df = 4),
+                                                              data = d))
+rf_cv_spatial        <- run_cv(folds_spatial, function(d) randomForest(pct_commute_60p ~ ., data = d, ntree = 500))
+
 ## Train RF on full dataset (used for map predictions — outside the CV loop)
 rf_fit <- randomForest(
   pct_commute_60p ~ .,
   data       = model_data,
+  ntree      = 500,
+  importance = TRUE
+)
+
+## Spatial-lag production fits — used by the spillover IBX simulation
+lm_fit_standardized_spatial <- lm(
+  pct_commute_60p_logit ~ . - GEOID - pct_commute_60p,
+  data = ml_data_scaled
+)
+
+lm_fit_spline_spatial <- lm(
+  pct_commute_60p_logit ~ . - GEOID - pct_commute_60p - dist_subway_miles
+    + splines::ns(dist_subway_miles, df = 4),
+  data = ml_data_scaled
+)
+
+set.seed(622)
+rf_fit_spatial <- randomForest(
+  pct_commute_60p ~ .,
+  data       = ml_data_scaled[, c(target_var, spatial_predictor_vars)],
   ntree      = 500,
   importance = TRUE
 )
@@ -1009,8 +1090,11 @@ cv_summary <- function(name, cv_df) {
 
 cv_table <- bind_rows(
   cv_summary("Linear Regression",                  lm_cv),
+  cv_summary("Linear Regression + Spatial Lags",   lm_cv_spatial),
   cv_summary("Linear + Spline (dist_subway_miles)", lm_spline_cv),
-  cv_summary("Random Forest",                       rf_cv)
+  cv_summary("Linear + Spline + Spatial Lags",     lm_spline_cv_spatial),
+  cv_summary("Random Forest",                       rf_cv),
+  cv_summary("Random Forest + Spatial Lags",       rf_cv_spatial)
 )
 
 # One-SE rule: any model within (best_RMSE + SE_of_best) is "as good as best".
@@ -1023,7 +1107,7 @@ kable(cv_table %>% mutate(across(where(is.numeric), ~ round(., 3))),
       caption = "10-fold CV (stratified by borough) — mean ± SE, one-SE rule flag")
 ```
 
-**Interpretation:** Random Forest wins clearly; it's the only model within 1 SE of the best, and each step up (linear → spline → RF) gains predictive power. The spline-to-RF gap (`r round(cv_table$RMSE_mean[3] - cv_table$RMSE_mean[2], 2)` RMSE) is bigger than the lm-to-spline gap (`r round(cv_table$RMSE_mean[2] - cv_table$RMSE_mean[1], 2)`), meaning RF is catching nonlinearities and interactions the spline alone can't. RF's typical prediction is off by ~`r round(cv_table$RMSE_mean[3], 1)`pp on the 0-100% scale and explains ~`r round(cv_table$R2_mean[3] * 100)`% of variance. For the IBX simulation, Models 2 and 3 are better to lean on. Model 1 can't capture the saturating subway-access effect, so its predicted relief is essentially zero.
+**Interpretation:** Random Forest + Spatial Lags is the CV-best by just a little bit, with `r round(cv_table$RMSE_mean[6], 2)` RMSE vs `r round(cv_table$RMSE_mean[5], 2)` for plain Random Forest. The two Random Forest variants are the only rows within 1 SE of the best, so they're statistically a tie, but we're opting to treat Random Forest + Spatial Lags as the winner. Its typical prediction is off by ~`r round(cv_table$RMSE_mean[6], 1)`pp on the 0-100% scale, and it explains ~`r round(cv_table$R2_mean[6] * 100)`% of variance. There are also two patterns in the table that are worth pointing at. Across the spatial-lag axis, every model class gains roughly 0.10 to 0.15 RMSE once neighbor-weighted features are added (Linear Regression `r round(cv_table$RMSE_mean[1], 2)` to `r round(cv_table$RMSE_mean[2], 2)`, Linear + Spline `r round(cv_table$RMSE_mean[3], 2)` to `r round(cv_table$RMSE_mean[4], 2)`, Random Forest `r round(cv_table$RMSE_mean[5], 2)` to `r round(cv_table$RMSE_mean[6], 2)`). The improvement is consistent across all three classes. Basically, neighbors are carrying real signal beyond what a tract's own features capture. Across the model-family axis, the jump from Linear + Spline to Random Forest (`r round(cv_table$RMSE_mean[5] - cv_table$RMSE_mean[3], 2)` RMSE) is bigger than the jump from Linear Regression to Linear + Spline (`r round(cv_table$RMSE_mean[3] - cv_table$RMSE_mean[1], 2)`), meaning Random Forest is catching nonlinearities and interactions the spline alone can't. For the IBX simulation, the Linear + Spline, Random Forest, and spatial-lag variants are the ones to lean on. Plain Linear Regression can't capture the saturating subway-access effect, so its predicted relief is essentially zero. The spatial-lag variants also let predicted relief spill over to tracts next to the new corridor, so they reach more tracts than the non-spatial versions (more on that in the IBX simulation section below).
 
 P.s. the "saturating subway-access effect" was just the most succinct way I could phrase "the effect where 5 minutes versus 10 minutes as a walk to the subway is a big different, but 20 minutes versus 25 is not". Ajs Prof. George pointed this out to us in feedback notes at some point in time.
 
@@ -1145,7 +1229,7 @@ ibx_tracts_sf <- st_filter(
 ibx_geoid_list <- intersect(ibx_tracts_sf$GEOID, ml_data_scaled$GEOID)
 ```
 
-The IBX simulation works like this: geocode the 19 IBX station addresses, draw 0.5-mile walksheds around each, and flag every tract that intersects a walkshed as "treated." For treated tracts we set `dist_subway_miles` to the city-wide minimum (i.e., "this tract now has subway access as close as the best-served tract in NYC") and re-predict commute outcomes. The same setup runs through all three predictive models (linear, spline, RF) so we can compare how each forecasts IBX's effect. It's a coarse proxy for what a real subway station does, but a defensible starting point.
+The IBX simulation works like this: geocode the 19 IBX station addresses, draw 0.5-mile walksheds around each, and flag every tract that intersects a walkshed as "treated." For the treated tracts, we're setting `dist_subway_miles` to the city-wide minimum. This is our way of saying that this tract now has subway access as close as the best-served tract in NYC. We then re-predict commute outcomes. The same setup runs through all six model variants (Linear, Linear + Spline, Random Forest, each with and without spatial lags) so we can compare how each forecasts IBX's effect. The spatial-lag variants additionally let predicted relief spill over to tracts next to the IBX corridor (more on that below). It's a coarse proxy for what a real subway station does, but a defensible starting point.
 
 ```{r ibx-simulator-dataset-and-model}
 ## Create an IBX UNIVERSE data set
@@ -1217,6 +1301,70 @@ cat("RF relief range: ", range(final_map_data_rf$ibx_commute_relief_rf), "\n")
 saveRDS(final_map_data_rf, file.path(projPath, "data", "model_input.rds"))
 print("RF predictions appended to model_input.rds")
 ```
+
+#### IBX simulation with spatial-lag spillover
+
+Same scenario as the non-lag versions (push `dist_subway_miles` to the global minimum for treated tracts), but with one extra step: we recompute `lag_dist_subway_miles` using the modified values. That way tracts neighboring the IBX corridor see their neighbor-weighted subway-distance drop too, and the spatial models can express spillover benefits to those adjacent tracts. The other six lag columns don't move because their underlying features aren't part of the simulation.
+
+```{r ibx-spatial-predictions}
+# Build the spatial scenario: modify dist_subway_miles (same as before) AND
+# recompute its spatial lag using the updated values.
+ibx_scenario_data_spatial <- ml_data_scaled %>%
+  mutate(
+    dist_subway_miles = ifelse(GEOID %in% ibx_geoid_list,
+                                best_transit_z_score,
+                                dist_subway_miles)
+  )
+
+ibx_scenario_data_spatial$lag_dist_subway_miles <-
+  lag.listw(weights, ibx_scenario_data_spatial$dist_subway_miles, zero.policy = TRUE)
+
+# Predict from the three spatial models on baseline and IBX scenarios.
+# Append to final_map_data_rf so all simulation outputs live in one frame.
+final_map_data_rf <- final_map_data_rf %>%
+  mutate(
+    # Linear + Spatial Lags
+    predicted_commute_baseline_lm_spatial = pmax(0, pmin(100, logit_to_pct(predict(lm_fit_standardized_spatial, newdata = ml_data_scaled)))),
+    predicted_commute_ibx_lm_spatial      = pmax(0, pmin(100, logit_to_pct(predict(lm_fit_standardized_spatial, newdata = ibx_scenario_data_spatial)))),
+    ibx_commute_relief_lm_spatial         = pmax(0, predicted_commute_baseline_lm_spatial - predicted_commute_ibx_lm_spatial),
+
+    # Spline + Spatial Lags
+    predicted_commute_baseline_spline_spatial = pmax(0, pmin(100, logit_to_pct(predict(lm_fit_spline_spatial, newdata = ml_data_scaled)))),
+    predicted_commute_ibx_spline_spatial      = pmax(0, pmin(100, logit_to_pct(predict(lm_fit_spline_spatial, newdata = ibx_scenario_data_spatial)))),
+    ibx_commute_relief_spline_spatial         = pmax(0, predicted_commute_baseline_spline_spatial - predicted_commute_ibx_spline_spatial),
+
+    # RF + Spatial Lags
+    predicted_commute_baseline_rf_spatial = pmax(0, predict(rf_fit_spatial, newdata = ml_data_scaled)),
+    predicted_commute_ibx_rf_spatial      = pmax(0, predict(rf_fit_spatial, newdata = ibx_scenario_data_spatial)),
+    ibx_commute_relief_rf_spatial         = pmax(0, predicted_commute_baseline_rf_spatial - predicted_commute_ibx_rf_spatial)
+  )
+
+# Range printouts
+cat("\n--- Spatial-lag IBX simulation ranges ---\n")
+cat("lm + lags relief range:     ", range(final_map_data_rf$ibx_commute_relief_lm_spatial), "\n")
+cat("spline + lags relief range: ", range(final_map_data_rf$ibx_commute_relief_spline_spatial), "\n")
+cat("RF + lags relief range:     ", range(final_map_data_rf$ibx_commute_relief_rf_spatial), "\n")
+
+# Spillover diagnostic: how many tracts get non-zero relief in each scenario?
+# Non-spatial: only directly-treated tracts.
+# Spatial: directly-treated + their neighbors (because the lag changed for them).
+cat("\n--- Spillover breadth (tracts with non-zero predicted relief) ---\n")
+cat("Treated tracts in dataset:    ", length(ibx_geoid_list), "\n")
+cat("Non-spatial (lm / spline / rf):       ",
+    sum(final_map_data_rf$ibx_commute_relief         > 0), "/",
+    sum(final_map_data_rf$ibx_commute_relief_spline  > 0), "/",
+    sum(final_map_data_rf$ibx_commute_relief_rf      > 0), "\n")
+cat("Spatial (lm+lag / spline+lag / rf+lag):",
+    sum(final_map_data_rf$ibx_commute_relief_lm_spatial      > 0), "/",
+    sum(final_map_data_rf$ibx_commute_relief_spline_spatial  > 0), "/",
+    sum(final_map_data_rf$ibx_commute_relief_rf_spatial      > 0), "\n")
+
+saveRDS(final_map_data_rf, file.path(projPath, "data", "model_input.rds"))
+```
+
+**Interpretation:** The spillover diagnostic above adds a second dimension to the IBX picture. Without spatial lags, the simulation only registers relief for directly-treated tracts. The Linear model predicts zero for every tract. Linear + Spline reaches all `r sum(final_map_data_rf$ibx_commute_relief_spline > 0)` treated tracts. Random Forest reaches `r sum(final_map_data_rf$ibx_commute_relief_rf > 0)` of them. With spatial lags, the same three model classes reach `r sum(final_map_data_rf$ibx_commute_relief_lm_spatial > 0)` / `r sum(final_map_data_rf$ibx_commute_relief_spline_spatial > 0)` / `r sum(final_map_data_rf$ibx_commute_relief_rf_spatial > 0)` tracts (Linear, Linear + Spline, Random Forest). That broader reach comes from the way we recompute `lag_dist_subway_miles` after the treatment update. Once a tract's neighbors get closer to subway, the tract's own neighbor-weighted distance-to-subway also drops, so the spatial model picks up the spillover.
+
+Max relief grows too. Plain Linear stays at 0pp (no saturating-effect capture). Linear + Spatial Lags rescues it to `r round(max(final_map_data_rf$ibx_commute_relief_lm_spatial), 2)`pp. Linear + Spline goes from `r round(max(final_map_data_rf$ibx_commute_relief_spline), 2)`pp to `r round(max(final_map_data_rf$ibx_commute_relief_spline_spatial), 2)`pp. Random Forest goes from `r round(max(final_map_data_rf$ibx_commute_relief_rf), 2)`pp to `r round(max(final_map_data_rf$ibx_commute_relief_rf_spatial), 2)`pp. Random Forest + Spatial Lags ends up with the highest max relief and the most tracts reached, which lines up with it being the CV-best model overall.
 
 ```{r model-outputs}
 
@@ -1333,14 +1481,25 @@ How to read Moran's I:
 - I ≈ 0: residuals are spatially random — the model captures geographic structure well.
 - I < 0: residuals checkerboard (rare in real data) — would be unusual.
 
-**The Moran's I value above is *after* we added `dist_to_manhattan_miles`.** Before that feature, Moran's I was 0.079 (p < 10⁻¹⁰) — a much stronger spatial signal. Adding distance to Grand Central as a CBD-proximity proxy:
+```{r historical-pre-manhattan-constants}
+# Snapshot of the analysis state just before we added dist_to_manhattan_miles.
+# Hardcoded because the prior model state isn't reproducible from current code.
+hist_before <- list(
+  morans_i             = 0.079,
+  morans_i_p           = "1e-10",
+  rmse_reduction_range = "0.3-0.4",
+  spline_rf_gap_pp     = 1.4
+)
+```
 
-- Cut Moran's I roughly in half (0.079 → 0.036)
-- Reduced cross-validated RMSE by 0.3–0.4 across all three models
-- Caused several previously-significant coefficients (borough effects for Brooklyn and Queens, `uber_trips_per_capita`, `pop_density`) to lose their inflated magnitudes — they had been silently proxying for Manhattan proximity
-- Tightened spline-vs-RF IBX agreement to ~0.5pp (was ~1.4pp)
+**The Moran's I value above is *after* we added `dist_to_manhattan_miles`.** Before that feature, Moran's I was `r hist_before$morans_i` (p < `r hist_before$morans_i_p`), a much stronger spatial signal. Here's what changed when we added distance to Grand Central as a CBD-proximity proxy. (This is a snapshot from before the spatial-lag work that came later.)
 
-The pure linear baseline now predicts ~0pp IBX relief: its coefficient on `dist_subway_miles` shrank to -0.008. The spline and RF, which can capture the saturating subway-access effect, both predict ~7-8pp — much closer agreement than before (5.5pp vs 6.9pp).
+- Cut Moran's I roughly in half (`r hist_before$morans_i` -> `r round(unname(moran_test$estimate["Moran I statistic"]), 3)`)
+- Reduced cross-validated RMSE by `r hist_before$rmse_reduction_range` across the three model classes we had at that point (Linear, Linear + Spline, Random Forest)
+- Caused several previously-significant coefficients (borough effects for Brooklyn and Queens, `uber_trips_per_capita`, `pop_density`) to lose their inflated magnitudes. They had been silently proxying for Manhattan proximity.
+- Tightened spline-vs-RF IBX agreement to ~`r round(abs(max(final_map_data_rf$ibx_commute_relief_rf) - max(final_map_data_rf$ibx_commute_relief_spline)), 1)`pp (was ~`r hist_before$spline_rf_gap_pp`pp)
+
+After that change, the pure linear baseline predicts ~`r round(max(final_map_data_rf$ibx_commute_relief), 0)`pp IBX relief (its coefficient on `dist_subway_miles` is `r round(unname(coef(lm_fit_standardized)["dist_subway_miles"]), 3)`), while the Linear + Spline and Random Forest models, which capture the saturating subway-access effect, predict around 7-8pp: Linear + Spline at `r round(max(final_map_data_rf$ibx_commute_relief_spline), 1)`pp and Random Forest at `r round(max(final_map_data_rf$ibx_commute_relief_rf), 1)`pp. Adding spatial lags on top of all this widened the relief picture further. See the CV table interpretation above and the IBX simulation diagnostics for the current numbers.
 
 ### BART (Bayesian Additive Regression Trees)
 Predicts the effect of an intervention (e.g., a new medicine) by combining hundreds of small, simple decision trees to model complex, non-linear relationships, even without explicit programming. It excels at estimating, "What would have happened to this specific person if they had taken the treatment?". 
@@ -1501,12 +1660,20 @@ ATC / ATU (Average Treatment Effect on the Control/Untreated): Measures the impa
 
 ATE BART Fit
 ```{r}
+# Exclude the treatment mechanism (dist_subway_miles and its spatial lag) from
+# the BART confounders. Including them would condition on the very feature the
+# IBX changes, which controls away the main causal pathway.
+dist_cols    <- grep("dist_subway_miles", names(BART_df), value = TRUE)
+exclude_cols <- c("y", "z", dist_cols)
+
+set.seed(622)
 bart_fit <- bartc(
-  response = BART_df$y,
-  treatment = BART_df$z,
-  confounders = BART_df[, !(names(BART_df) %in% c("y", "z"))],
-  estimand = "ate"
+  response    = BART_df$y,
+  treatment   = BART_df$z,
+  confounders = BART_df[, !(names(BART_df) %in% exclude_cols)],
+  estimand    = "ate"
 )
+cat("BART refitted excluding from confounders:", paste(dist_cols, collapse = ", "), "\n")
 ```
 
 ```{r}
@@ -1664,6 +1831,28 @@ rpart.plot(tree_model, main = "Subgroups Driving Treatment Effect Heterogeneity"
 
 **How to interpret:** A regression tree on ITE for treated tracts only. Each split is the question that best separates "tracts with bigger benefit" from "tracts with smaller benefit." Each terminal node shows the predicted ITE for tracts that follow that path (the % at the bottom shows what share of tracts ended up there). Read top-to-bottom along a branch to identify "tracts with feature X beyond Y benefit Z amount."
 
+```{r save-bart-ite-to-map}
+# Append BART's individual treatment effect (ITE) per tract to the map data so
+# the Shiny app can visualize the causal estimates alongside the predictive ones.
+# ITE rows match ml_data_scaled row order; we map back to GEOID for a safe join.
+bart_ite_df <- data.frame(
+  GEOID    = ml_data_scaled$GEOID,
+  bart_ite = as.numeric(fitted(bart_fit, type = "icate"))
+)
+
+final_map_data_rf <- final_map_data_rf %>%
+  select(-any_of(c("bart_ite", "bart_ite_treated_only"))) %>%
+  left_join(bart_ite_df, by = "GEOID") %>%
+  mutate(
+    bart_ite_treated_only = ifelse(is_ibx_location == 1, bart_ite, NA_real_)
+  )
+
+saveRDS(final_map_data_rf, file.path(projPath, "data", "model_input.rds"))
+```
+
+<!-- Preserved exploratory work, hidden from knit output and not evaluated.
+Production spatial-lag work lives in the build-spatial-lags and random-forest-model chunks earlier in the doc.
+
 #### SPATIAL LAGS: include averages of neighboring tract values to account for spatial autocorrelation
 
 For each tract (GEOID), you want variables like:
@@ -1672,7 +1861,7 @@ average treatment in neighboring tracts
 average covariates in neighboring tracts
 
 Define spatial neighbors
-```{r}
+```{r, eval=FALSE, include=FALSE}
 #install.packages("spdep")
 library(sf)
 library(spdep)
@@ -1690,28 +1879,28 @@ weights   <- nb2listw(neighbors, style = "W", zero.policy = TRUE)
 ```
 
 Create spatial lag variables
-```{r}
+```{r, eval=FALSE, include=FALSE}
 spatial_lag_df <- BART_df
 ```
 
 Outcome lag (neighbor avg commute time)
-```{r}
+```{r, eval=FALSE, include=FALSE}
 spatial_lag_df$lag_commute <- lag.listw(weights, BART_df$y)
 ```
 
 Treatment lag (neighbor treatment exposure)
-```{r}
+```{r, eval=FALSE, include=FALSE}
 spatial_lag_df$lag_treatment <- lag.listw(weights, BART_df$z)
 ```
 
 EXAMPLES of others we can add:
-```{r}
+```{r, eval=FALSE, include=FALSE}
 spatial_lag_df$lag_income <- lag.listw(weights, BART_df$x.med_income)
 #ml_data_scaled$lag_distance_from_ny <- lag.listw(weights, BART_df$ WE SHOULD ADD A DISTANCE FROM MANHATTAN VARIABLE)
 ```
 
 Need to edit and add this when done to add it to our map:
-```{r ibx-BART-predictions}
+```{r ibx-BART-predictions, eval=FALSE, include=FALSE}
 # Append BART IBX predictions to the map data already saved by the chunk above.
 # final_map_data is still in memory — adding RF columns and re-saving.
 
@@ -1725,6 +1914,31 @@ Need to edit and add this when done to add it to our map:
 #saveRDS(final_map_data_rf, file.path(projPath, "data", "model_input.rds"))
 #print("RF predictions appended to model_input.rds")
 ```
+-->
+
+
+## Summary of Findings
+
+The question we wanted to answer was: how would the new Interborough Express (IBX) subway line change commute times for the NYC neighborhoods it would serve? Our best model says the IBX would cut the share of 60+ minute commutes by up to ~`r round(max(final_map_data_rf$ibx_commute_relief_rf_spatial), 1)`pp in tracts within walking distance of a new station, plus measurable benefits spilling over to `r sum(final_map_data_rf$ibx_commute_relief_rf_spatial > 0 & final_map_data_rf$is_ibx_location == 0)` nearby tracts that don't have a station of their own. The benefit isn't even across the city. Queens neighborhoods gain the most on average, in both our predictive simulation and our causal estimates. Brooklyn tracts gain too, just less.
+
+**Predictive modeling.** We trained six versions of a model that predicts the share of long commutes in each tract. Three core types (Linear Regression, Linear + Spline, Random Forest), each tested with and without "spatial-lag" features. Spatial lags are just a way of letting each tract's model also see its neighbors' values. 10-fold cross-validation picked Random Forest + Spatial Lags as the best at `r round(cv_table$RMSE_mean[6], 2)` RMSE, with plain Random Forest close behind at `r round(cv_table$RMSE_mean[5], 2)` and statistically tied within 1 SE. The neighbor-aware features helped every type. Basically, what's happening around a tract carries real information about that tract's outcomes. To run the IBX simulation, we set each treated tract's distance to the subway to the city's smallest value (the closest any NYC tract is to a station) and re-ran the predictions. The spatial-lag versions go one step further. After the distance changes for treated tracts, we re-compute the neighbor-averages too, which is how the spillover effect shows up.
+
+**Causal modeling.** Separately from the predictive modeling, we used a method called bartCause to estimate what each tract's commute outcome would be if it got an IBX station of its own. One important fix happened along the way. An earlier version of the model included `dist_subway_miles` as a confounder, but that variable IS the mechanism the IBX changes. Controlling for it removed the effect we were trying to measure. Excluding it (and its spatial lag) from the BART confounders gave us a causal estimate that agrees with the predictive simulation in direction. Magnitudes are smaller than the predictive ones (BART's max benefit is around `r round(abs(min(final_map_data_rf$bart_ite_treated_only, na.rm = TRUE)), 1)`pp versus the predictive simulation's `r round(max(final_map_data_rf$ibx_commute_relief_rf_spatial), 0)`pp max relief), which is expected. BART estimates an average causal effect with Bayesian shrinkage toward zero, while the predictive model reports max relief under an extreme scenario. Queens treated tracts get the biggest causal benefit (mean `r round(mean(final_map_data_rf$bart_ite_treated_only[final_map_data_rf$borough == "Queens"], na.rm = TRUE), 2)`pp). Brooklyn benefits too but less (mean `r round(mean(final_map_data_rf$bart_ite_treated_only[final_map_data_rf$borough == "Brooklyn"], na.rm = TRUE), 2)`pp). `r sum(final_map_data_rf$bart_ite_treated_only > 0 & final_map_data_rf$borough == "Brooklyn", na.rm = TRUE)` Brooklyn tracts show tiny positive ITE that we treat as noise. The model also produces counterfactual estimates for boroughs the IBX doesn't actually serve (Bronx, Manhattan, Staten Island), but we treat those with caution since BART is extrapolating into territory it didn't see in the data.
+
+**Limitations.**
+
+- We treat a tract as "treated by IBX" if any part of it falls within a 0.5-mile walk of any new station. That's too generous. A tract barely touching a walk-zone gets credit for the same treatment as one sitting right on top of a station. A graded version would be more honest.
+- We simulate the IBX by setting each treated tract's distance to subway to the smallest value in the city. This is a rough proxy. It doesn't capture things like how often the IBX runs, how many lines connect at a station, or whether a station is a major transfer point.
+- The IBX station addresses are geocoded through OpenStreetMap, which doesn't always return every address on every run. The count of geocoded stations (and so the count of treated tracts) bounces around a bit between runs.
+- The predictive simulation gives a single point estimate of IBX relief without uncertainty bounds. The causal (BART) side does include posterior credible intervals, so we have honest uncertainty there at least.
+
+**Future work.**
+
+- Add XGBoost as a fourth model family for the predictive comparison.
+- Add SHAP values for our best model (Random Forest + Spatial Lags) so we can explain individual tract predictions.
+- Try a graded version of the IBX treatment (partial credit for partial walk-zone coverage) and see how much that shifts the answer.
+- Add a convergence-check plot for the BART model.
+- Refit the BART propensity model without `dist_subway_miles` (the propensity formula still includes it, which carries the mediator effect partly through the propensity score).
 
 ## Misc. Notes Dump
  
@@ -1739,4 +1953,6 @@ George: Second, you may want think about whether linear relationships are approp
 George: Try the the bartCause R package. It has built in a lot of model checks that determine how much you can truly say about causal effects given the data. read about it more here: https://apsta.shinyapps.io/thinkCausal/. IMO it is better than the CausalForest stuff from the EconML package, but that is my subjective opinion.
 
 George: In the predicted 60m commute time, note the presence of negative values. I highly recommend applying a transformation to take the interval from 0-1 to the entire number line, i.e. a log transformation or a sigmoid function of some type. This would prevent the negative number issue.
+
+BART mediator-as-confounder fix: An earlier version of bart_fit included `dist_subway_miles` and `lag_dist_subway_miles` in the confounders, which IS the variable the IBX changes. Controlling for it removed the causal pathway we were trying to measure. The original BART estimates came back with tiny positive ITE for most treated tracts (all 148 Brooklyn treated tracts positive, mean +0.5pp), which contradicted the predictive simulation. We refit BART without those two columns. The new estimates agree with the predictive simulation in direction (treatment helps most treated tracts) but with smaller magnitudes due to BART's Bayesian shrinkage toward zero.
 
