@@ -33,6 +33,10 @@ ui <- fluidPage(
                       "Predicted 60m+ Commutes (With IBX)" = "predicted_commute_ibx_rf_spatial",
                       "Drop in Long-Commute Share (pp)"    = "ibx_commute_relief_rf_spatial"
                     ),
+                    "🎯 Causal Estimate (BART)" = c(
+                      "All Tracts (extrapolated outside corridor)" = "bart_ite",
+                      "IBX Corridor Only"                          = "bart_ite_treated_only"
+                    ),
                     "📈 IBX Predictive Simulation (Linear)" = c(
                       "Predicted 60m+ Commutes (Current)" = "predicted_commute_baseline",
                       "Predicted 60m+ Commutes (With IBX)" = "predicted_commute_ibx",
@@ -121,6 +125,8 @@ server <- function(input, output, session) {
     "predicted_commute_ibx_rf_spatial"          = "RF+Lags: Simulated 60m+ Commute (Post-IBX)",
     "ibx_commute_relief_rf_spatial"             = "RF+Lags: Drop in 60+ Min Commute Rate (pp)",
     "rf_residual"                   = "RF Residuals (Actual − Predicted)",
+    "bart_ite"                      = "BART Treatment Effect, All Tracts (pp)",
+    "bart_ite_treated_only"         = "BART Treatment Effect, IBX Corridor (pp)",
     "pct_commute_60p"            = "Actual 60m+ Commute Rate",
     "is_ibx_location"            = "IBX Station Area (0.5mi)",
     "dist_subway_miles"          = "Distance to Subway (Miles)",
@@ -157,7 +163,7 @@ server <- function(input, output, session) {
     if (!is.numeric(var_data) && selected_var != "is_ibx_location") return(NULL)
     
     # Formatting symbols
-    suffix_symbol <- ifelse(grepl("ibx_commute_relief", selected_var), " pp",
+    suffix_symbol <- ifelse(grepl("ibx_commute_relief|bart_ite", selected_var), " pp",
                        ifelse(grepl("pct_|commute", selected_var), "%", ""))
     prefix_symbol <- ifelse(selected_var == "med_income", "$", "")
     
@@ -169,7 +175,7 @@ server <- function(input, output, session) {
       pal <- colorNumeric("Blues", domain = var_data, na.color = "transparent")
     } else if (selected_var %in% c("ibx_commute_relief_rf", "ibx_commute_relief_rf_spatial")) {
       pal <- colorNumeric("viridis", domain = var_data, reverse = TRUE, na.color = "transparent")
-    } else if (selected_var == "rf_residual") {
+    } else if (selected_var %in% c("rf_residual", "bart_ite", "bart_ite_treated_only")) {
       pal <- colorNumeric("RdBu", domain = var_data, na.color = "transparent")
     } else if (selected_var %in% c("ibx_commute_relief", "ibx_commute_relief_lm_spatial")) {
       pal <- colorNumeric("YlGn", domain = var_data, na.color = "transparent")
