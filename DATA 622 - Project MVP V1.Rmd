@@ -938,6 +938,45 @@ print("Model Summary: ")
 summary(lm_fit_standardized)
 ```
 
+#### Spatial lag features
+
+For each geographic predictor below, we compute the neighbor-weighted average (the "spatial lag"). This lets a model express patterns like "a tract's commute outcomes depend on its own features AND on its neighbors' features." We keep the original predictors as-is so we can compare with-lag vs. without-lag model performance directly.
+
+```{r build-spatial-lags}
+library(spdep)
+library(sf)
+
+# Same spatial weights pattern as the residual diagnostic. Row order matches
+# ml_data_scaled, so lag.listw is correctly positional.
+tracts_sf <- nyc_tracts_clean %>%
+  filter(GEOID %in% ml_data_scaled$GEOID) %>%
+  arrange(match(GEOID, ml_data_scaled$GEOID))
+
+neighbors <- poly2nb(tracts_sf)
+weights   <- nb2listw(neighbors, style = "W", zero.policy = TRUE)
+
+# Predictors with the most geographic structure. Skipping the outcome
+# (lag-of-outcome opens the SAR can of worms) and skipping categorical
+# borough (lag of factor levels is awkward).
+predictors_to_lag <- c(
+  "dist_to_manhattan_miles", "dist_subway_miles",
+  "pop_density", "pct_transit", "pct_wfh",
+  "med_income", "stations_per_1000_pop"
+)
+
+# Compute each lag column inside ml_data_scaled.
+for (col in predictors_to_lag) {
+  ml_data_scaled[[paste0("lag_", col)]] <-
+    lag.listw(weights, ml_data_scaled[[col]], zero.policy = TRUE)
+}
+
+# Sanity: no Inf/NaN in the new lag columns
+lag_finite_check <- ml_data_scaled %>%
+  select(starts_with("lag_")) %>%
+  summarise(across(everything(), ~ sum(!is.finite(.))))
+print(lag_finite_check)
+```
+
 ### Model 3: Random Forest + 10-fold Cross-Validation
 
 Two jobs in this section: train the Random Forest (Model 3), and put all three models through 10-fold cross-validation to compare them "head-to-head".
@@ -946,6 +985,8 @@ CV mechanics: each model is fit 10 times (once per fold, on the 90% training sid
 
 A separate fit of `rf_fit` on the full dataset happens at the end (that's the version used by the IBX simulation downstream, separate from the CV loop).
 
+Each model class also gets a "+ Spatial Lags" variant: same model, but the predictor set is augmented with the neighbor-weighted lag columns built in the previous chunk. The same row assignments are reused across all six runs (same seed, same `vfold_cv` call) so any pair (with vs. without lags) is directly comparable.
+
 
 ```{r random-forest-model} 
 ## CV SETUP
@@ -953,6 +994,15 @@ A separate fit of `rf_fit` on the full dataset happens at the end (that's the ve
 # comparisons are paired 
 set.seed(622)
 model_data <- ml_data_scaled[, c(target_var, predictor_vars)]
+
+# Spatial-lag predictor set: original predictors + the lag_* columns added
+# in the build-spatial-lags chunk. Same target, same row order.
+spatial_predictor_vars <- c(
+  predictor_vars,
+  paste0("lag_", predictors_to_lag)
+)
+model_data_spatial <- ml_data_scaled[, c(target_var, spatial_predictor_vars)]
+
 folds <- rsample::vfold_cv(model_data, v = 10, strata = borough)
 
 # Fit one model on the analysis side of a fold, predict on the assessment side.
@@ -976,10 +1026,40 @@ lm_spline_cv <- run_cv(folds, function(d) lm(pct_commute_60p ~ . - dist_subway_m
                                               data = d))
 rf_cv        <- run_cv(folds, function(d) randomForest(pct_commute_60p ~ ., data = d, ntree = 500))
 
+## SPATIAL-LAG VARIANTS: same models, same folds (same seed + same rows),
+## but using model_data_spatial so the lag_* columns enter as predictors.
+set.seed(622)
+folds_spatial <- rsample::vfold_cv(model_data_spatial, v = 10, strata = borough)
+
+lm_cv_spatial        <- run_cv(folds_spatial, function(d) lm(pct_commute_60p ~ ., data = d))
+lm_spline_cv_spatial <- run_cv(folds_spatial, function(d) lm(pct_commute_60p ~ . - dist_subway_miles
+                                                              + splines::ns(dist_subway_miles, df = 4),
+                                                              data = d))
+rf_cv_spatial        <- run_cv(folds_spatial, function(d) randomForest(pct_commute_60p ~ ., data = d, ntree = 500))
+
 ## Train RF on full dataset (used for map predictions — outside the CV loop)
 rf_fit <- randomForest(
   pct_commute_60p ~ .,
   data       = model_data,
+  ntree      = 500,
+  importance = TRUE
+)
+
+## Spatial-lag production fits — used by the spillover IBX simulation
+lm_fit_standardized_spatial <- lm(
+  pct_commute_60p_logit ~ . - GEOID - pct_commute_60p,
+  data = ml_data_scaled
+)
+
+lm_fit_spline_spatial <- lm(
+  pct_commute_60p_logit ~ . - GEOID - pct_commute_60p - dist_subway_miles
+    + splines::ns(dist_subway_miles, df = 4),
+  data = ml_data_scaled
+)
+
+rf_fit_spatial <- randomForest(
+  pct_commute_60p ~ .,
+  data       = ml_data_scaled[, c(target_var, spatial_predictor_vars)],
   ntree      = 500,
   importance = TRUE
 )
@@ -1009,8 +1089,11 @@ cv_summary <- function(name, cv_df) {
 
 cv_table <- bind_rows(
   cv_summary("Linear Regression",                  lm_cv),
+  cv_summary("Linear Regression + Spatial Lags",   lm_cv_spatial),
   cv_summary("Linear + Spline (dist_subway_miles)", lm_spline_cv),
-  cv_summary("Random Forest",                       rf_cv)
+  cv_summary("Linear + Spline + Spatial Lags",     lm_spline_cv_spatial),
+  cv_summary("Random Forest",                       rf_cv),
+  cv_summary("Random Forest + Spatial Lags",       rf_cv_spatial)
 )
 
 # One-SE rule: any model within (best_RMSE + SE_of_best) is "as good as best".
@@ -1023,7 +1106,7 @@ kable(cv_table %>% mutate(across(where(is.numeric), ~ round(., 3))),
       caption = "10-fold CV (stratified by borough) — mean ± SE, one-SE rule flag")
 ```
 
-**Interpretation:** Random Forest wins clearly; it's the only model within 1 SE of the best, and each step up (linear → spline → RF) gains predictive power. The spline-to-RF gap (`r round(cv_table$RMSE_mean[3] - cv_table$RMSE_mean[2], 2)` RMSE) is bigger than the lm-to-spline gap (`r round(cv_table$RMSE_mean[2] - cv_table$RMSE_mean[1], 2)`), meaning RF is catching nonlinearities and interactions the spline alone can't. RF's typical prediction is off by ~`r round(cv_table$RMSE_mean[3], 1)`pp on the 0-100% scale and explains ~`r round(cv_table$R2_mean[3] * 100)`% of variance. For the IBX simulation, Models 2 and 3 are better to lean on. Model 1 can't capture the saturating subway-access effect, so its predicted relief is essentially zero.
+**Interpretation:** Random Forest wins clearly; it's the only model within 1 SE of the best, and each step up (linear → spline → RF) gains predictive power. The spline-to-RF gap (`r round(cv_table$RMSE_mean[5] - cv_table$RMSE_mean[3], 2)` RMSE) is bigger than the lm-to-spline gap (`r round(cv_table$RMSE_mean[3] - cv_table$RMSE_mean[1], 2)`), meaning RF is catching nonlinearities and interactions the spline alone can't. RF's typical prediction is off by ~`r round(cv_table$RMSE_mean[5], 1)`pp on the 0-100% scale and explains ~`r round(cv_table$R2_mean[5] * 100)`% of variance. For the IBX simulation, Models 2 and 3 are better to lean on. Model 1 can't capture the saturating subway-access effect, so its predicted relief is essentially zero. The "+ Spatial Lags" rows below let us see directly whether adding neighbor-weighted features helps any of the three model classes; revisit this paragraph after running, since the comparison story may shift.
 
 P.s. the "saturating subway-access effect" was just the most succinct way I could phrase "the effect where 5 minutes versus 10 minutes as a walk to the subway is a big different, but 20 minutes versus 25 is not". Ajs Prof. George pointed this out to us in feedback notes at some point in time.
 
@@ -1216,6 +1299,66 @@ cat("RF relief range: ", range(final_map_data_rf$ibx_commute_relief_rf), "\n")
 
 saveRDS(final_map_data_rf, file.path(projPath, "data", "model_input.rds"))
 print("RF predictions appended to model_input.rds")
+```
+
+#### IBX simulation with spatial-lag spillover
+
+Same scenario as the non-lag versions (push `dist_subway_miles` to the global minimum for treated tracts), but with one extra step: we recompute `lag_dist_subway_miles` using the modified values. That way tracts neighboring the IBX corridor see their neighbor-weighted subway-distance drop too, and the spatial models can express spillover benefits to those adjacent tracts. The other six lag columns don't move because their underlying features aren't part of the simulation.
+
+```{r ibx-spatial-predictions}
+# Build the spatial scenario: modify dist_subway_miles (same as before) AND
+# recompute its spatial lag using the updated values.
+ibx_scenario_data_spatial <- ml_data_scaled %>%
+  mutate(
+    dist_subway_miles = ifelse(GEOID %in% ibx_geoid_list,
+                                best_transit_z_score,
+                                dist_subway_miles)
+  )
+
+ibx_scenario_data_spatial$lag_dist_subway_miles <-
+  lag.listw(weights, ibx_scenario_data_spatial$dist_subway_miles, zero.policy = TRUE)
+
+# Predict from the three spatial models on baseline and IBX scenarios.
+# Append to final_map_data_rf so all simulation outputs live in one frame.
+final_map_data_rf <- final_map_data_rf %>%
+  mutate(
+    # Linear + Spatial Lags
+    predicted_commute_baseline_lm_spatial = pmax(0, pmin(100, logit_to_pct(predict(lm_fit_standardized_spatial, newdata = ml_data_scaled)))),
+    predicted_commute_ibx_lm_spatial      = pmax(0, pmin(100, logit_to_pct(predict(lm_fit_standardized_spatial, newdata = ibx_scenario_data_spatial)))),
+    ibx_commute_relief_lm_spatial         = pmax(0, predicted_commute_baseline_lm_spatial - predicted_commute_ibx_lm_spatial),
+
+    # Spline + Spatial Lags
+    predicted_commute_baseline_spline_spatial = pmax(0, pmin(100, logit_to_pct(predict(lm_fit_spline_spatial, newdata = ml_data_scaled)))),
+    predicted_commute_ibx_spline_spatial      = pmax(0, pmin(100, logit_to_pct(predict(lm_fit_spline_spatial, newdata = ibx_scenario_data_spatial)))),
+    ibx_commute_relief_spline_spatial         = pmax(0, predicted_commute_baseline_spline_spatial - predicted_commute_ibx_spline_spatial),
+
+    # RF + Spatial Lags
+    predicted_commute_baseline_rf_spatial = pmax(0, predict(rf_fit_spatial, newdata = ml_data_scaled)),
+    predicted_commute_ibx_rf_spatial      = pmax(0, predict(rf_fit_spatial, newdata = ibx_scenario_data_spatial)),
+    ibx_commute_relief_rf_spatial         = pmax(0, predicted_commute_baseline_rf_spatial - predicted_commute_ibx_rf_spatial)
+  )
+
+# Range printouts
+cat("\n--- Spatial-lag IBX simulation ranges ---\n")
+cat("lm + lags relief range:     ", range(final_map_data_rf$ibx_commute_relief_lm_spatial), "\n")
+cat("spline + lags relief range: ", range(final_map_data_rf$ibx_commute_relief_spline_spatial), "\n")
+cat("RF + lags relief range:     ", range(final_map_data_rf$ibx_commute_relief_rf_spatial), "\n")
+
+# Spillover diagnostic: how many tracts get non-zero relief in each scenario?
+# Non-spatial: only directly-treated tracts.
+# Spatial: directly-treated + their neighbors (because the lag changed for them).
+cat("\n--- Spillover breadth (tracts with non-zero predicted relief) ---\n")
+cat("Treated tracts in dataset:    ", length(ibx_geoid_list), "\n")
+cat("Non-spatial (lm / spline / rf):       ",
+    sum(final_map_data_rf$ibx_commute_relief         > 0), "/",
+    sum(final_map_data_rf$ibx_commute_relief_spline  > 0), "/",
+    sum(final_map_data_rf$ibx_commute_relief_rf      > 0), "\n")
+cat("Spatial (lm+lag / spline+lag / rf+lag):",
+    sum(final_map_data_rf$ibx_commute_relief_lm_spatial      > 0), "/",
+    sum(final_map_data_rf$ibx_commute_relief_spline_spatial  > 0), "/",
+    sum(final_map_data_rf$ibx_commute_relief_rf_spatial      > 0), "\n")
+
+saveRDS(final_map_data_rf, file.path(projPath, "data", "model_input.rds"))
 ```
 
 ```{r model-outputs}
