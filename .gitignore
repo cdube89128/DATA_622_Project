@@ -1,6 +1,9 @@
 *.csv
 *.Rmd
 *.html
+*.RData
+.DS_Store
 citibike/
 taxi_zones/
+references/
 references/*.pdf
