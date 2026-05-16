@@ -23,6 +23,7 @@ pacman::p_load(
    tidycensus,
    r5r, 
    sf, #spacial data handling
+   spdep, #spacial cont.
    tigris, #NYC geography
    mapview,
    osmextract,
@@ -36,7 +37,8 @@ pacman::p_load(
    here,    # project-root-aware paths (works interactive AND during knit)
    rsample,  # k-fold CV
    rlang,
-   randomForest
+   randomForest,
+   ggplot2
 )
 
 # Resolve projPath: source-editor path when interactive, here() during knit.
@@ -332,13 +334,13 @@ ggplot(missing_map_data) +
        fill = "Status")
 ```
 
-**How to interpret:** Red tracts are missing the median income field; gray tracts have valid data. If the red dots cluster (same borough, same neighborhood), any model relying on `med_income` will be geographically biased — we'd be making predictions in those areas without real data. Scattered red is much less harmful.
+**Interpretation:** Red tracts are missing the median income field; gray tracts have valid data. About 126 of NYC's 2,327 tracts (around 5%) are missing income. The pattern leans toward the outer boroughs - Staten Island (7.1%), Queens (6.8%), and the Bronx (6.6%) miss income more often than Brooklyn (4.1%) or Manhattan (3.5%). The lean is real but not extreme. Rather than dropping the tracts, we can impute borough-level medians so each missing tract gets filled in from its own borough's distribution.
 
 #### Census NA Handling
 
 This chunk is currently dropping census tracts that have very few people or no workers.
 
-It's also **imputing** where income or age was missing using the median value. This was just a simple implementation, but we can definitely consider more robust imputing methos, and also properly investingating MAR, MNAR etc. (Though given the nature of census data, MNAR is a good assumption.)
+It's also **imputing** where income or age was missing using the median value. This was just a simple implementation, but we can definitely consider more robust imputing methods, and also properly investigating MAR, MNAR etc. (Though given the nature of census data, MNAR is a good assumption.)
 
 ```{r census-na-handling}
 ## Drop tracts with less than 50 people or 0 workers
@@ -455,7 +457,7 @@ taxi_zones <- taxi_zones_sf %>%
 plot(st_geometry(taxi_zones))
 ```
 
-**How to interpret:** Sanity check that the 263 NYC taxi zones loaded and overlay correctly. We're looking for a recognizable NYC silhouette — five boroughs visible, no obvious gaps or holes. If the shape looks broken, the shapefile didn't load right.
+**Interpretation: ** Just wanting to double check /sanity check that the shape of the taxi zones looks right.
 
 ### TLC Data
 
@@ -681,11 +683,12 @@ print("Subway distance feature successfully calculated from MTA data!")
 
 ### Distance to Manhattan (CBD)
 
-Borough fixed effects can't tell apart "Williamsburg, 1 mile from Manhattan" and "Bay Ridge, 8 miles away" — they're both Brooklyn, same borough effect. This chunk computes distance from each tract to **Grand Central Terminal** as a CBD-proximity proxy. Per George's flag.
+We realized that thee borough fixed effects can't tell the difference between say "Williamsburg, 1 mile from Manhattan" and "Bay Ridge, 8 miles away". In that example, both are in Brooklyn, so they get the same borough effect. This chunk is being added to compute distance from each tract to **Grand Central Terminal** as a CBD-proximity proxy. (George pointed out that we might need something like this)
 
 ```{r manhattan-distance}
-## Distance from each tract to Grand Central — proxy for "proximity to the
-## Manhattan CBD". Same point_on_surface reference points as subway distance.
+## Distance from each tract to Grand Central 
+## proxy for "proximity to the Manhattan CBD". 
+## Using the same point_on_surface reference points as subway distance.
 
 # Grand Central Terminal: 40.7527° N, 73.9772° W
 grand_central <- st_sfc(st_point(c(-73.9772, 40.7527)), crs = 4326) %>%
@@ -812,7 +815,7 @@ print(top_uber)
 
 ## Model Building 
 
-This section has 3 predictive models:
+This section has 3 predictive model types:
 
 * Linear Regression "baseline" model. 
 * A linear model with a natural cubic spline on `dist_subway_miles`
@@ -823,7 +826,7 @@ It also has 1 causal model
  
 ### Borough Fixed Effects
 
-Prof. George flagged that NYC neighborhoods are very different from each other. Added this section, and borough as a factor variable lets both models learn a borough-level intercept, capturing unobserved variation that our census features don't fully explain.
+The Prof. / George flagged that NYC neighborhoods are very different from each other. Added this section, and borough as a factor variable lets both models learn a borough-level intercept, capturing unobserved variation that our census features don't fully explain.
 
 Borough is derived from the first 5 digits of GEOID (standard Census FIPS codes) so no additional data pull is needed.
 
@@ -849,18 +852,18 @@ saveRDS(master_table, file.path(projPath, "data", "model_input.rds"))
 print(table(master_table$borough))
 ```
 
-### Models 1 and 2: Linear Regression (with and without spline)
+### Model Types 1 and 2: Linear Regression (with and without spline)
 
 Two linear baselines:
 
 * `lm_fit_standardized`: pure linear regression
 * `lm_fit_spline`L same model + a natural cubic spline on `dist_subway_miles`
 
-Updated this section so that both fit on a logit-transformed outcome so predictions stay in [0, 100]. (Without it, `lm` was predicting percentages that didn't make sense because they were outsid ethat range).
+We went back and updated this section so that both fit on a logit-transformed outcome so predictions stay in [0, 100]. (Without it, `lm` was predicting percentages that didn't make sense because they were outside that range).
 
-The spline version handles the saturating distance effect Prof. George flagged. When the distance to the subway is closer it matters a lot, far doesn't.
+The spline version handles the saturating distance effect George flagged. When the distance to the subway is closer it matters a lot, far doesn't.
 
-Heavy-tailed predictors (`uber_trips_per_capita`, `bike_trips_per_capita`, `stations_per_1000_pop`, `pop_density`) get a `log1p()` transform before z-scoring. Prof. George also pointed this out at some point, that some of these variables would have heavily skewed distributions. After logging, a 1 SD change in the standardized predictor is an order-of-magnitude change rather than an absolute one, which is the right scale for these variables.
+Heavy-tailed predictors (`uber_trips_per_capita`, `bike_trips_per_capita`, `stations_per_1000_pop`, `pop_density`) get a `log1p()` transform before z-scoring. George also pointed this out at some point, that some of these variables would have heavily skewed distributions. After logging, a 1 SD change in the standardized predictor is an order-of-magnitude change rather than an absolute one, which is the right scale for these variables.
 
 ```{r machine-learning-poc}
 # The selection for the Machine Learning model
@@ -920,7 +923,7 @@ ml_data_scaled <- ml_data_raw %>%
   # Small offset handles 0% / 100% edges without -Inf/+Inf.
   mutate(pct_commute_60p_logit = qlogis((pct_commute_60p + 0.5) / 101))
 
-# Helper: bring logit-space predictions back to raw % space.
+# Helper: making it easier to bring logit-space predictions back to raw % space.
 logit_to_pct <- function(z) (plogis(z) * 101) - 0.5
 
 ## TRAIN THE MODEL
@@ -940,14 +943,15 @@ summary(lm_fit_standardized)
 
 #### Spatial lag features
 
-For each geographic predictor below, we compute the neighbor-weighted average (the "spatial lag"). This lets a model express patterns like "a tract's commute outcomes depend on its own features AND on its neighbors' features." We keep the original predictors as-is so we can compare with-lag vs. without-lag model performance directly.
+Based on feedback, we went back and added spatil lag feautred. For each geographic predictor below, we compute the neighbor-weighted average (the "spatial lag"). This lets a model express patterns like "a tract's commute outcomes depend on its own features AND on its neighbors' features." We keep the original predictors as-is so we can compare with-lag vs. without-lag model performance directly.
 
 ```{r build-spatial-lags}
-library(spdep)
-library(sf)
+#library(spdep)
+#library(sf)
 
-# Same spatial weights pattern as the residual diagnostic. Row order matches
-# ml_data_scaled, so lag.listw is correctly positional.
+# Set up neighbor relationships between tracts (which tracts share a border).
+# Row order must match ml_data_scaled exactly because the lag function below pairs rows by position, not by tract ID. 
+# Mismatched order = wrong neighbors.
 tracts_sf <- nyc_tracts_clean %>%
   filter(GEOID %in% ml_data_scaled$GEOID) %>%
   arrange(match(GEOID, ml_data_scaled$GEOID))
@@ -955,9 +959,8 @@ tracts_sf <- nyc_tracts_clean %>%
 neighbors <- poly2nb(tracts_sf)
 weights   <- nb2listw(neighbors, style = "W", zero.policy = TRUE)
 
-# Predictors with the most geographic structure. Skipping the outcome
-# (lag-of-outcome opens the SAR can of worms) and skipping categorical
-# borough (lag of factor levels is awkward).
+# These predictors have the most geographic structure, meaning neighboring tracts tend to have similar values for them. 
+# Skipping two on purpose: the outcome (lagging it would turn this into a spatial autoregressive model, i think), and borough (can't take a neighbor average of a category).
 predictors_to_lag <- c(
   "dist_to_manhattan_miles", "dist_subway_miles",
   "pop_density", "pct_transit", "pct_wfh",
@@ -1107,7 +1110,14 @@ kable(cv_table %>% mutate(across(where(is.numeric), ~ round(., 3))),
       caption = "10-fold CV (stratified by borough) — mean ± SE, one-SE rule flag")
 ```
 
-**Interpretation:** Random Forest + Spatial Lags is the CV-best by just a little bit, with `r round(cv_table$RMSE_mean[6], 2)` RMSE vs `r round(cv_table$RMSE_mean[5], 2)` for plain Random Forest. The two Random Forest variants are the only rows within 1 SE of the best, so they're statistically a tie, but we're opting to treat Random Forest + Spatial Lags as the winner. Its typical prediction is off by ~`r round(cv_table$RMSE_mean[6], 1)`pp on the 0-100% scale, and it explains ~`r round(cv_table$R2_mean[6] * 100)`% of variance. There are also two patterns in the table that are worth pointing at. Across the spatial-lag axis, every model class gains roughly 0.10 to 0.15 RMSE once neighbor-weighted features are added (Linear Regression `r round(cv_table$RMSE_mean[1], 2)` to `r round(cv_table$RMSE_mean[2], 2)`, Linear + Spline `r round(cv_table$RMSE_mean[3], 2)` to `r round(cv_table$RMSE_mean[4], 2)`, Random Forest `r round(cv_table$RMSE_mean[5], 2)` to `r round(cv_table$RMSE_mean[6], 2)`). The improvement is consistent across all three classes. Basically, neighbors are carrying real signal beyond what a tract's own features capture. Across the model-family axis, the jump from Linear + Spline to Random Forest (`r round(cv_table$RMSE_mean[5] - cv_table$RMSE_mean[3], 2)` RMSE) is bigger than the jump from Linear Regression to Linear + Spline (`r round(cv_table$RMSE_mean[3] - cv_table$RMSE_mean[1], 2)`), meaning Random Forest is catching nonlinearities and interactions the spline alone can't. For the IBX simulation, the Linear + Spline, Random Forest, and spatial-lag variants are the ones to lean on. Plain Linear Regression can't capture the saturating subway-access effect, so its predicted relief is essentially zero. The spatial-lag variants also let predicted relief spill over to tracts next to the new corridor, so they reach more tracts than the non-spatial versions (more on that in the IBX simulation section below).
+**Interpretation:** Random Forest + Spatial Lags is the CV-best by just a little bit, with `r round(cv_table$RMSE_mean[6], 2)` RMSE vs `r round(cv_table$RMSE_mean[5], 2)` for plain Random Forest. 
+
+* The two Random Forest variants are the only rows within 1 SE of the best, so they're statistically a tie, but we're opting to treat Random Forest + Spatial Lags as the winner. 
+* Its typical prediction is off by ~`r round(cv_table$RMSE_mean[6], 1)`pp on the 0-100% scale, and it explains ~`r round(cv_table$R2_mean[6] * 100)`% of variance. 
+* There are also two patterns in the table that are worth pointing at. 
+  * Across the spatial-lag axis, every model class gains roughly 0.10 to 0.15 RMSE once neighbor-weighted features are added (Linear Regression `r round(cv_table$RMSE_mean[1], 2)` to `r round(cv_table$RMSE_mean[2], 2)`, Linear + Spline `r round(cv_table$RMSE_mean[3], 2)` to `r round(cv_table$RMSE_mean[4], 2)`, Random Forest `r round(cv_table$RMSE_mean[5], 2)` to `r round(cv_table$RMSE_mean[6], 2)`). The improvement is consistent across all three classes. Basically, neighbors are carrying real signal beyond what a tract's own features capture. 
+  * Across the model-family axis, the jump from Linear + Spline to Random Forest (`r round(cv_table$RMSE_mean[5] - cv_table$RMSE_mean[3], 2)` RMSE) is bigger than the jump from Linear Regression to Linear + Spline (`r round(cv_table$RMSE_mean[3] - cv_table$RMSE_mean[1], 2)`), meaning Random Forest is catching nonlinearities and interactions the spline alone can't. For the IBX simulation, the Linear + Spline, Random Forest, and spatial-lag variants are the ones to lean on. Plain Linear Regression can't capture the saturating subway-access effect, so its predicted relief is essentially zero. 
+* The spatial-lag variants also let predicted relief spill over to tracts next to the new corridor, so they reach more tracts than the non-spatial versions (more on that in the IBX simulation section below).
 
 P.s. the "saturating subway-access effect" was just the most succinct way I could phrase "the effect where 5 minutes versus 10 minutes as a walk to the subway is a big different, but 20 minutes versus 25 is not". Ajs Prof. George pointed this out to us in feedback notes at some point in time.
 
@@ -1168,9 +1178,8 @@ ggplot(oob_curve, aes(x = ntree, y = oob_rmse)) +
        x = "Number of trees", y = "OOB RMSE")
 ```
 
-**How to interpret:** OOB error should drop fast, then plateau. If the curve flattens well before the right edge, 500 trees is enough. If it's still falling at the right edge, ntree should be higher. The dashed red line marks the final OOB value — looking for the curve to be hugging it.
 
-**Interpretation:** mtry sweep was a near-tie — the algorithmic best was mtry=`r rf_tuning$mtry[which.min(rf_tuning$OOB_RMSE)]` at OOB RMS `r round(min(rf_tuning$OOB_RMSE), 3)`, but `r sum(rf_tuning$within_1pct_of_best == "✓")` of 5 values landed within 1% of the best, so we went with ISLP's default mtry=7 (RMSE `r round(rf_tuning$OOB_RMSE[rf_tuning$mtry == 7], 3)`). That mtry=2 (essentially bagging) is only marginally worse tells us feature decorrelation isn't doing heavy lifting on this dataset. The OOB-vs-ntree curve drops fast from ~`r round(oob_curve$oob_rmse[1], 1)` at ntree=1 to ~`r round(oob_curve$oob_rmse[200], 2)` by ntree=200, then flatlines through 500 — confirming ntree=500 is well past the plateau. Could safely cut to ~300 trees, but 500 is standard so we kept it.
+**Interpretation:**OOB error should dropped quickly and then plateaued. And the dashed red line is markig the final OOB value. The mtry sweep was a near-tie: the algorithmic best was mtry=`r rf_tuning$mtry[which.min(rf_tuning$OOB_RMSE)]` at OOB RMS `r round(min(rf_tuning$OOB_RMSE), 3)`, but `r sum(rf_tuning$within_1pct_of_best == "✓")` of 5 values landed within 1% of the best, so we went with ISLP's default mtry=7 (RMSE `r round(rf_tuning$OOB_RMSE[rf_tuning$mtry == 7], 3)`). That mtry=2 (essentially bagging) is only marginally worse tells us feature decorrelation isn't doing heavy lifting on this dataset. The OOB-vs-ntree curve dropped fast from `r round(oob_curve$oob_rmse[1], 1)` at ntree=1 to `r round(oob_curve$oob_rmse[200], 2)` by ntree=200, then flatlines.  So ntree=500 is well past the plateau and definitely enough. We could even cut bak to ~300 trees, but 500 is pretty standard so we kept it.
 
 ### IBX Simulation
 
@@ -1384,10 +1393,14 @@ ggplot(lm_results, aes(x = estimate, y = reorder(term, estimate))) +
        y = "Feature")
 ```
 
-**How to interpret:** Each point is a feature's standardized coefficient — how much logit(% long commute) shifts per 1 SD change in that feature, holding everything else fixed. Distance from zero = effect strength; the red dashed line marks "no effect." Borough effects (vs Brooklyn baseline) and `dist_to_manhattan_miles` tend to dominate. Error bars show ±1 SE — features whose bars cross zero aren't statistically distinguishable from zero effect.
+**How to interpret:** Each point is a feature's standardized coefficient: how much logit(% long commute) shifts per 1 SD change in that feature, holding everything else fixed. Distance from zero = effect strength; the red dashed line marks "no effect." Borough effects (vs Brooklyn baseline) and `dist_to_manhattan_miles` tend to dominate. Error bars show ±1 SE. These are features whose bars cross zero aren't statistically distinguishable from zero effect.
 
-**Interpretation:** Distance to Manhattan and being in Manhattan are the dominant features. Together they carry most of the geography story (more distance from Manhattan → more long commutes; Manhattan itself strongly fewer). The most counterintuitive coefficient is `pct_transit` (`r sprintf("%+.2f", lm_results$estimate[lm_results$term == "pct_transit"])`, p < 10⁻¹⁶) — tracts where more people commute by transit have more
-long commutes, reflecting NYC's reality that long-distance commuters disproportionately use the subway. Distance to subway in the linear model is essentially zero (`r sprintf("%+.3f", lm_results$estimate[lm_results$term == "dist_subway_miles"])`, p=`r round(lm_results$p.value[lm_results$term == "dist_subway_miles"], 2)`); the relationship is saturating, which is why we added the spline. After controlling for distance to Manhattan, Queens and Bronx are statistical ties with Brooklyn; only Manhattan and Staten Island stand out as boroughs with meaningfully fewer long commutes.
+**Interpretation:** 
+
+* Distance to Manhattan and being in Manhattan are the dominant features. Together they carry most of the geography story (more distance from Manhattan → more long commutes; Manhattan itself strongly fewer). 
+* The most counterintuitive coefficient is `pct_transit` (`r sprintf("%+.2f", lm_results$estimate[lm_results$term == "pct_transit"])`, p < 10⁻¹⁶).  Tracts where more people commute by transit have more long commutes, reflecting NYC's reality that long-distance commuters disproportionately use the subway. 
+* Distance to subway in the linear model is essentially zero (`r sprintf("%+.3f", lm_results$estimate[lm_results$term == "dist_subway_miles"])`, p=`r round(lm_results$p.value[lm_results$term == "dist_subway_miles"], 2)`); the relationship is saturating, which is why we added the spline. 
+* After controlling for distance to Manhattan, Queens and Bronx are statistical ties with Brooklyn; only Manhattan and Staten Island stand out as boroughs with meaningfully fewer long commutes.
 
 ```{r rf-feature-importance}
 # Variable importance from the full RF model
@@ -1408,32 +1421,23 @@ ggplot(rf_importance, aes(x = `%IncMSE`, y = reorder(Feature, `%IncMSE`))) +
   )
 ```
 
-**How to interpret:** Higher %IncMSE = the feature mattered more for prediction (test error rises more when that feature is randomly shuffled). Compare to the lm coefficient plot — features ranking high in both are "robustly important." A feature high in RF but flat in lm typically means RF is capturing a nonlinear or interaction effect that lm can't.
+**How to interpret:** Higher %IncMSE = the feature mattered more for prediction (test error rises more when that feature is randomly shuffled). When comparing to the lm coefficient plot, the features ranking high in both are "robustly important." A feature high in RF but flat in lm typically means RF is capturing a nonlinear or interaction effect that lm can't.
 
-**Interpretation:** RF's top three features — `pct_transit`,
-`dist_to_manhattan_miles`, and `pct_wfh` — are largely the same top
-features the linear model picked, so the predictive story holds across
-model classes. The big difference: `dist_subway_miles` ranks
-#`r which(rf_importance$Feature == "dist_subway_miles")` in RF
-(%IncMSE =
-`r round(rf_importance$"%IncMSE"[rf_importance$Feature == "dist_subway_miles"], 1)`)
-despite being essentially zero in the linear model
-(`r sprintf("%+.3f", lm_results$estimate[lm_results$term == "dist_subway_miles"])`,
-p=`r round(lm_results$p.value[lm_results$term == "dist_subway_miles"], 2)`)
-— clean confirmation that the relationship is nonlinear, which is
-exactly what the spline was meant to capture. `borough` only ranks
-#`r which(rf_importance$Feature == "borough")` here — RF can use the
-continuous geographic features directly, so it leans less on the
-categorical borough proxy than the lm does. The bottom of the list
-(age buckets, `pct_vacant`) carries little predictive weight;
-candidates for trimming if we ever wanted a leaner feature set.
+**Interpretation:** 
+
+* RF's top three features — `pct_transit`, `dist_to_manhattan_miles`, and `pct_wfh`, are largely the same top features the linear model picked, so the predictive story holds across model classes. 
+* The big difference is that `dist_subway_miles` ranks #`r which(rf_importance$Feature == "dist_subway_miles")` in RF
+(%IncMSE = `r round(rf_importance$"%IncMSE"[rf_importance$Feature == "dist_subway_miles"], 1)`)
+despite being essentially zero in the linear model (`r sprintf("%+.3f", lm_results$estimate[lm_results$term == "dist_subway_miles"])`,
+p=`r round(lm_results$p.value[lm_results$term == "dist_subway_miles"], 2)`). This confirmed that the relationship is nonlinear, which is what we wanted the spline to capture. 
+* `borough` only ranks #`r which(rf_importance$Feature == "borough")` here. RF can use the continuous geographic features directly, so it leans less on the categorical borough proxy than the lm does. The bottom of the list (age buckets, `pct_vacant`) carries little predictive weight; candidates for trimming if we ever wanted a leaner feature set.
 
 #### RF Residual Diagnostics
 
-If RF residuals cluster geographically, the model is missing a feature with spatial structure (likely "proximity to Manhattan" per George's flag). The map shows where the model under- or over-predicts; Moran's I quantifies whether the clustering is statistically meaningful.
+If RF residuals cluster geographically, the model is missing a feature with spatial structure (likely "proximity to Manhattan" per George's flag). The map shows where the model under or over predicts; Moran's I quantifies whether the clustering is statistically meaningful.
 
 ```{r rf-residual-diagnostic}
-library(spdep)
+#library(spdep)
 
 ## RESIDUAL MAP
 residual_map_data <- final_map_data_rf %>%
@@ -1472,8 +1476,6 @@ cat("Moran's I:   ", round(moran_test$estimate["Moran I statistic"], 3), "\n")
 cat("Expected:    ", round(moran_test$estimate["Expectation"], 3),       "\n")
 cat("p-value:     ", format.pval(moran_test$p.value),                     "\n")
 ```
-
-**How to interpret the map:** Red = the model under-predicts (the real % long commute is *higher* than what the model expected). Blue = over-predicts. Patches of solid color = the model has a systematic geographic blind spot — a missing feature with spatial structure. A salt-and-pepper mix of red and blue = the model captures geography fine, residuals are just noise.
 
 How to read Moran's I:
 
@@ -1541,7 +1543,8 @@ x <- BART_data[, !(names(BART_data) %in% c("pct_commute_60p", "ibx_treatment"))]
 
 ```
 
-Visualize the data:
+#### Visualize the data: 1
+
 1. overlap graph? (for ATE, ATT, and ATC). Overlap is a property of the data (treatment vs covariates)
 ```{r}
 ps_model <- glm(
@@ -1565,7 +1568,7 @@ legend("topright", legend = c("Treated", "Control"),
        fill = c(rgb(1,0,0,0.5), rgb(0,0,1,0.5)))
 ```
 
-**How to interpret:** Red = treated tracts, blue = untreated. Good overlap (the two distributions both span the same range) is required for trustworthy causal estimates. Poor overlap (e.g., red cluster at high values, blue at low) means the BART model has to extrapolate — comparing treated tracts to controls that don't really resemble them.
+**Interpretation** Red = treated tracts, blue = untreated. There is an okay overlap; the two distributions both span the same range in general, which is important for trustworthy causal estimates. But blue is definitely more on the left, red on the right, and that means BART has got to extrapolate a bit to compare things there. 
 
 Weighting for ATE, ATT, ATC
 ```{r}
@@ -1576,7 +1579,6 @@ w_atc <- ifelse(z == 1, (1 - ps)/ps, 1)
 
 ATE plot: We want strong overlap across full range. Poor overlap implies ATE relies on extrapolation? 
 ```{r}
-library(ggplot2)
 
 BART_df <- data.frame(ps = ps, z = z, y = y, x=x)
 BART_df <- na.omit(BART_df)
@@ -1587,7 +1589,7 @@ ggplot(BART_df, aes(x = ps, fill = factor(z))) +
   labs(title = "Overlap (ATE)", fill = "Treatment")
 ```
 
-**How to interpret:** Same idea as the basic overlap plot, but reweighted for the **ATE** (effect on the average tract, treated or not). Tighter alignment between the two density curves = more trustworthy ATE estimate. Big gaps between curves at certain propensity values = those tracts have no good comparison group.
+**Interpretation:** This is the same idea as the basic overlap plot, but reweighted for the **ATE** (effect on the average tract, treated or not). A tighter alignment between the two density curves = more trustworthy ATE estimate. But here we definitely some very noticeable differences in the curve shapes on the left hand side of the x axis.
 
 ATT plot: Do control units resemble treated units?
 ```{r}
@@ -1597,7 +1599,7 @@ ggplot(BART_df, aes(x = ps, fill = factor(z))) +
   labs(title = "Overlap (ATT)", fill = "Treatment")
 ```
 
-**How to interpret:** Reweighted for the **ATT** — the effect on tracts that *received* treatment (the IBX corridor). Look for the control (blue) curve to match the shape of the treated (red) curve — that means we have similar-looking untreated tracts to compare each treated tract against.
+**Interpretation:** This is reweighted for the **ATT**, the effect on tracts that *received* treatment (the IBX corridor). Once again, the more aligned the curves are, the more trustworthy the ATT estimate. The ranges of the red and blue areas are somewhat similar here, but the shapes od those curves are quite different. We "can" make this comparison, but BART has to do some extrapolation.
 
 ATC plot: Do treated units resemble controls?
 ```{r}
@@ -1607,9 +1609,11 @@ ggplot(BART_df, aes(x = ps, fill = factor(z))) +
   labs(title = "Overlap (ATC)", fill = "Treatment")
 ```
 
-**How to interpret:** Mirror image of the ATT plot — reweighted for tracts that *did not* receive treatment (everywhere except the IBX corridor). Good overlap here means we have treated tracts that resemble each control tract, so a hypothetical "if we treated this Bronx tract, what would happen?" estimate is well-grounded.
+**Interpretation*:* This is much like the plots we've already looked at. The conclusions are also very much the same as the one directly above.
 
-2. Balance graph, poitns represent the treatment group (for ATE, ATT, and ATC).
+#### Visualize the data: 2
+
+2. Balance graph, points represent the treatment group (for ATE, ATT, and ATC).
 Each point = a covariate. X-axis = standardized mean difference (SMD). Two sets of points: Before weighting and after weighting.
 |SMD| < 0.1 is generally considered “balanced”. Balance plots are still based on propensity-style weighting. They diagnose whether your causal identification assumption is plausible. If balance is poor, the BART ATE may still be biased, especially in regions with weak overlap. Should we be dropping any variables with weak overlap?
 
@@ -1631,7 +1635,7 @@ love.plot(bal_ate, threshold = 0.1, abs = TRUE,
           title = "Covariate Balance (ATE)",stars = "raw",stats = "mean.diffs")
 ```
 
-**How to interpret:** Each dot is a covariate. X-axis = absolute standardized mean difference (SMD) between treated and untreated groups for that covariate. Dashed line at 0.1 marks the standard "balanced" threshold. Anything to the right of 0.1 means treated and control groups *differ meaningfully* on that variable — and the weighting hasn't fully fixed it. Two columns of dots compare before-weighting vs after-weighting.
+**Interpretation** Each dot is a covariate. X-axis = absolute standardized mean difference (SMD) between treated and untreated groups for that covariate. Dashed line at 0.1 marks the standard "balanced" threshold. Anything to the right of 0.1 means treated and control groups *differ meaningfully* on that variable, and the weighting hasn't fully fixed it. Based on this, we do see that there is quite a bit of meaningful difference that has not been accounted for.
 
 Covariate Balance (ATT)
 ```{r}
@@ -1639,7 +1643,7 @@ love.plot(bal_att, threshold = 0.1, abs = TRUE,
           title = "Covariate Balance (ATT)", stars = "raw")
 ```
 
-**How to interpret:** Same as the ATE balance plot but reweighted for the ATT estimand. This is the most relevant of the three for our project since the IBX claim is "what does treatment do for the treated tracts." Anything past 0.1 here is a covariate where the comparison group doesn't quite match the treated group — flag-able for the writeup.
+**Interpretation:** ATT is arguably the relevant of the three (ATE, ATT, ATC) for our project since the IBX claim is basically "what does treatment do for the treated tracts." Anything past 0.1 here is a covariate where the comparison group doesn't quite match the treated group. There are a number of specifically unadjusted values that we see that meet this criteria. 
 
 Covariate Balance (ATC)
 ```{r}
@@ -1647,7 +1651,7 @@ love.plot(bal_atc, threshold = 0.1, abs = TRUE,
           title = "Covariate Balance (ATC)",stars = "raw")
 ```
 
-**How to interpret:** Same again, but reweighted for the ATC. Less directly relevant to our IBX question, but useful as a diagnostic — covariates that are imbalanced for ATC but not ATT tell us where the model is making bigger extrapolation leaps for the *un*treated tracts.
+**How to interpret:** Same again, but reweighted for the ATC. This is less directly relevant to our IBX question, but useful as a diagnostic. Comparing ATC to ATT, most covariates are well-balanced under ATT (almost all under the 0.1 threshold) but imbalanced under ATC. The biggest jumps are in transit share and its spatial lag, the spatial lag of population density, distance to subway, and median income. This kind of "asymmetry" makes sense given our data has about 200 treated tracts versus 2,020 untreated tracts. Re-weighting controls to look like treated (ATT) is reasonable because we have plenty of candidate controls to draw from. Re-weighting treated to look like the much larger and more diverse untreated set (ATC) requires more extrapolation than the data can comfortably support. The practical takeaway is that our ATT estimate sits on solid ground; ATC would lean heavily on BART filling in counterfactuals it can't observe directly.
 
 Fit our model:
 1. Causal Estimand: do we want ATE, ATT, and ATC? We're adding a new train line which is alittle different than just giving a new drug or something? I think we're most interested in ATT to measure how effective our treatment was for our area where we're adding it.
@@ -1709,7 +1713,7 @@ hist(ite[z == 1],
 abline(v = att, col = "red", lwd = 2)
 ```
 
-**How to interpret:** Distribution of individual treatment effects (ITE) across the *treated* tracts. The red vertical line is the ATT (average across treated). Negative ITE values = treatment reduces long-commute % (i.e. helps). All-negative = treatment uniformly helps every treated tract, which is what we want to see.
+**Interpretation:** Distribution of individual treatment effects (ITE) across the *treated* tracts. The red vertical line is the ATT (average across treated). Negative ITE values = treatment reduces long-commute % (i.e. helps). All-negative = treatment uniformly helps every treated tract. Fortuantely, this plot looks all negative! (Though the magnitude is quite small.)
 
 Results:
 
@@ -1729,7 +1733,7 @@ plot(ite_sorted, type = "l",
 abline(h = 0, col = "red", lwd = 2)
 ```
 
-**How to interpret:** Every tract's ITE plotted in sorted order, smallest (most negative = biggest benefit) on the left, largest on the right. The red zero-line is the threshold — anything below it = treatment helps that tract. The slope tells you how heterogeneous the effects are: a steep curve = lots of variation in who benefits; a flat curve = effects are uniform.
+**Interpretation:** This has every tract's ITE plotted in sorted order, smallest (most negative = biggest benefit) on the left, largest on the right. The slope explains how heterogeneous the effects are: a steep curve = lots of variation in who benefits; a flat curve = effects are uniform. According to this plot, we are seeing variation in who benefits.
 
 2. predictors of variation (tree depth graph)
 
@@ -1743,7 +1747,7 @@ var_model <- lm(ite ~ ., data = as.data.frame(x))
 summary(var_model)
 ```
 
-I guess this is expected, we put our new treatment line in queens, then ofc the biggest predictor of reduced commute from our new line in queens... is that the district is in queens...  
+ 
 ```{r}
 coef_df <- data.frame(
   variable = names(coef(var_model))[-1],
@@ -1758,7 +1762,7 @@ ggplot(coef_df, aes(x = reorder(variable, effect), y = effect)) +
        y = "Effect on ITE")
 ```
 
-**How to interpret:** Each bar is a feature's coefficient when regressing BART's ITE on covariates *across all NYC tracts*. **Negative coefficient = bigger benefit (more negative ITE) per unit of that feature.** Positive = smaller benefit. Borough bars dominate because they capture geography that the continuous predictors don't. Coefficients for boroughs the IBX doesn't actually serve (Bronx, Manhattan, Staten Island) reflect BART's *extrapolation* of "what would happen if we did treat them" — interpret cautiously.
+**Interpretation:** Each bar is a feature's coefficient when regressing BART's ITE on covariates *across all NYC tracts*. A negative coefficient = bigger benefit (more negative ITE) per unit of that feature. A positive coefficient = smaller benefit. Borough bars are very large (in terms of magnitude) because they capture geography that the continuous predictors don't. Coefficients for boroughs the IBX doesn't actually serve (Bronx, Manhattan, Staten Island) reflect BART's *extrapolation* of "what would happen if we did treat them".
 
 ##### TREATED TRACTS ONLY: Among the treated units only, which covariates explain variation in their treatment effects?
 
@@ -1791,7 +1795,7 @@ ggplot(coef_df, aes(x = reorder(variable, effect), y = effect)) +
        y = "Effect on ITE")
 ```
 
-**How to interpret:** Same as the previous bar plot but limited to actually-treated tracts — no extrapolation. **More defensible** than the all-tracts version. Negative bar = feature is associated with bigger benefit. The boroughQueens bar (negative) means Queens treated tracts benefit more than Brooklyn treated tracts (Brooklyn is the reference). The continuous predictors are mostly small here — borough explains most of the heterogeneity.
+**Interpretation: ** Okay we figured it out! Negative bar = feature is associated with bigger benefit. The boroughQueens bar (negative) means Queens treated tracts benefit more than Brooklyn treated tracts (becuase Brooklyn is the reference). 
 
 3. Exploratory subgroup analysis (histograms): explore treatment effect heterogeneity across subgroups
 
@@ -1829,7 +1833,11 @@ tree_model <- rpart(ite_treated ~ ., data = x_treated, method = "anova", control
 rpart.plot(tree_model, main = "Subgroups Driving Treatment Effect Heterogeneity")
 ```
 
-**How to interpret:** A regression tree on ITE for treated tracts only. Each split is the question that best separates "tracts with bigger benefit" from "tracts with smaller benefit." Each terminal node shows the predicted ITE for tracts that follow that path (the % at the bottom shows what share of tracts ended up there). Read top-to-bottom along a branch to identify "tracts with feature X beyond Y benefit Z amount."
+**Interpretation:** The dominant split is by borough. Queens treated tracts (n=51, mean ITE -0.42pp) get a larger predicted benefit than Brooklyn treated tracts (n=151, mean ITE -0.34pp), consistent with the borough-level finding elsewhere in our analysis.
+
+Within each borough, the secondary split is on pct_transit (the tract's own transit commute share), and the direction is the same on both sides: tracts with lower current transit usage benefit more. In Queens, the 19 tracts with the lowest pct_transit get the biggest predicted relief at -0.44pp. In Brooklyn, the 35 tracts with the lowest pct_transit get -0.40pp, and within that group the 14 whose neighbors also have very low transit use see -0.43pp. This is the saturating subway-access pattern we've talked about throughout: tracts where few people commute by transit today are typically car-dependent areas with no good transit option, and IBX gives them one.
+
+The biggest-benefit subgroup overall is the 19 Queens tracts with low transit usage (-0.44pp). The smallest-benefit subgroup is the 12 Brooklyn tracts with high vacancy and at-least-moderate transit usage (-0.29pp), areas where existing transit is already serving residents and IBX adds less marginal value.
 
 ```{r save-bart-ite-to-map}
 # Append BART's individual treatment effect (ITE) per tract to the map data so
